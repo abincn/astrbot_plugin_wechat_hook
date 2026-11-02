@@ -24,6 +24,7 @@ class Inbound:
     media_source_talker: str = ""
     media_path: str = ""
     quote_text: str = ""
+    media_error: str = ""
 
     @property
     def session_id(self) -> str:
@@ -91,7 +92,8 @@ def normalize_event(event: dict, self_wxid: str) -> Inbound | None:
     quote = event.get("quote") if isinstance(event.get("quote"), dict) else {}
     media_kind = {3: "image", 43: "video", 34: "voice", 47: "emoji"}.get(kind, "")
     media_msgsvrid = str(event.get("msgsvrid") or "")
-    media_source_talker = sender
+    # Hook's source_talker locates a conversation table, not a group member.
+    media_source_talker = room
     if kind == 49 and message_kind == "file_card":
         media_kind = "file"
     elif kind == 49 and message_kind == "quote":
@@ -99,7 +101,13 @@ def normalize_event(event: dict, self_wxid: str) -> Inbound | None:
         if qmedia.get("kind") in ("image", "video") and str(quote.get("msgsvrid") or "").isdecimal():
             media_kind = str(qmedia["kind"])
             media_msgsvrid = str(quote["msgsvrid"])
-            media_source_talker = str(quote.get("sender_id") or sender)
+            quoted_conversation = str(quote.get("conversation_id") or "")
+            if quoted_conversation and quoted_conversation != owner and quoted_conversation.endswith("@chatroom") == is_group:
+                try:
+                    conversation_session(owner, quoted_conversation)
+                    media_source_talker = quoted_conversation
+                except ValueError:
+                    pass
 
     event_id = str(event.get("event_id") or "")
     if not event_id:

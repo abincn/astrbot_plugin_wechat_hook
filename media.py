@@ -1,19 +1,37 @@
 """Verify media downloaded from Hook before exposing it to AstrBot."""
 import hashlib
 import json
-import logging
 from pathlib import Path
 import re
 
 import httpx
+from astrbot.api import logger as log
 from .events import normalize_event
 from .extra_media import download_voice, download_emoji
 
-log = logging.getLogger(__name__)
 
 MAX_IMAGE_BYTES = 12 * 1024 * 1024
 MAX_VIDEO_BYTES = 60 * 1024 * 1024
 LIMITS = {"image": MAX_IMAGE_BYTES, "video": MAX_VIDEO_BYTES, "file": 24 * 1024 * 1024}
+
+
+def safe_code(value, fallback: str) -> str:
+    return value if isinstance(value, str) and re.fullmatch(r"[a-z][a-z0-9_]{0,79}", value) else fallback
+
+
+def http_status(exc: Exception):
+    status = getattr(exc, "status_code", None)
+    if status is None and isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+    return status
+
+
+def request_error(exc: Exception) -> str:
+    status = http_status(exc)
+    code = safe_code(getattr(exc, "error_code", None), "")
+    if status is not None:
+        return f"hook_http_{status}" + (":" + code if code else "")
+    return type(exc).__name__
 
 
 def save_verified_media(folder: str | Path, data: bytes, artifact: dict, kind: str) -> Path:
@@ -88,15 +106,17 @@ async def process_pending_media(inbox, request, client, media_root: str | Path) 
                 else:
                     path, artifact = await download_emoji(source, media_root, save_verified_image)
                 inbox.media_ready(event_id, str(path), artifact)
-                log.info("Hook %s ready for event %s", kind, event_id)
+                log.info(f"Hook {kind} ready for event {event_id}")
             except (httpx.HTTPError, ValueError, TypeError, OSError) as exc:
-                inbox.media_unavailable(event_id, f"{kind}_unavailable: {type(exc).__name__}")
-                log.warning("Hook %s unavailable for event %s (%s)", kind, event_id, type(exc).__name__)
+                reason = request_error(exc)
+                inbox.media_unavailable(event_id, f"{kind}_unavailable: {reason}")
+                log.warning(f"Hook {kind} unavailable for event {event_id}: {reason}")
             continue
         if item["status"] == "new":
             if not inbox.begin_media(event_id):
                 continue
             try:
+                log.info(f"Hook {kind} received; requesting media for event {event_id}, source_talker={source.media_source_talker}")
                 original = source.media_msgsvrid
                 if not original.isdecimal():
                     raise ValueError("Missing numeric msgsvrid")
@@ -118,9 +138,11 @@ async def process_pending_media(inbox, request, client, media_root: str | Path) 
                 if isinstance(response.get("task"), dict):
                     verify_task_source(response["task"], source)
                 inbox.media_pending(event_id, task_id)
+                log.info(f"Hook {kind} task accepted: {task_id}, event={event_id}")
             except Exception as exc:
-                inbox.media_unknown(event_id, type(exc).__name__)
-                log.warning("Hook media request outcome unknown for %s (%s)", event_id, type(exc).__name__)
+                reason = request_error(exc)
+                inbox.media_unknown(event_id, reason)
+                log.warning(f"Hook {kind} media request unresolved for event {event_id}: {reason}; no automatic resubmission")
             continue
 
         task_id = str(item.get("task_id") or "")
@@ -137,10 +159,13 @@ async def process_pending_media(inbox, request, client, media_root: str | Path) 
             verify_task_source(task, source)
             state = str(task.get("state") or "").lower()
             if state in {"failed", "error", "cancelled", "stopped"}:
-                failed = inbox.media_unavailable if kind == "file" else inbox.media_failed
-                failed(event_id, "Hook media state: " + state)
+                reason = safe_code(task.get("error"), "hook_media_" + state)
+                inbox.media_unavailable(event_id, reason)
+                log.warning(f"Hook {kind} failed: event={event_id}, task={task_id}, error={reason}")
             elif state in {"unknown", "result_unknown", "timed_out", "timeout", "account_changed"}:
-                inbox.media_unknown(event_id, "Hook media state: " + state)
+                reason = safe_code(task.get("error"), "hook_media_" + state)
+                inbox.media_unknown(event_id, reason)
+                log.warning(f"Hook {kind} unresolved: event={event_id}, task={task_id}, error={reason}; no automatic resubmission")
             elif state == "ready":
                 artifact = task.get("artifact") or response.get("artifact") or {}
                 if not isinstance(artifact, dict):
@@ -160,11 +185,14 @@ async def process_pending_media(inbox, request, client, media_root: str | Path) 
                             raise ValueError("Media exceeds size limit")
                 path = save_verified_media(media_root, bytes(buf), artifact, kind)
                 inbox.media_ready(event_id, str(path), artifact)
-                log.info("Hook %s ready for event %s", kind, event_id)
-        except (httpx.HTTPError, RuntimeError):
+                log.info(f"Hook {kind} ready for event {event_id}, task={task_id}")
+        except (httpx.HTTPError, RuntimeError) as exc:
             # A status request can fail temporarily; keep the accepted task pending.
-            log.warning("Media task status/content currently unavailable for %s", event_id)
-        except (ValueError, KeyError, TypeError) as exc:
-            failed = inbox.media_unavailable if kind == "file" else inbox.media_failed
-            failed(event_id, str(exc))
-            log.warning("Hook %s media failed for %s: %s", kind, event_id, exc)
+            reason = request_error(exc)
+            if http_status(exc) in {404, 410}:
+                inbox.media_unknown(event_id, reason)
+            log.warning(f"Hook {kind} task status/content unavailable: event={event_id}, task={task_id}, error={reason}")
+        except (ValueError, KeyError, TypeError, OSError) as exc:
+            reason = str(exc) if isinstance(exc, ValueError) else type(exc).__name__
+            inbox.media_unavailable(event_id, reason)
+            log.warning(f"Hook {kind} verification failed for event {event_id}, task={task_id}: {reason}")

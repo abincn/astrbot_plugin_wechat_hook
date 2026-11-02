@@ -40,7 +40,13 @@ def inbound_content(item) -> tuple[str, list]:
     quote = item.quote
     if quote is not None:
         body = text(quote.get("reply_text"), 4500) or "[引用回复]"
+        missing = ""
+        if attachment is None and (item.media_kind or str(quote.get("message_type")) in {"3", "43", "62"}):
+            missing = "[引用附件未取得，无法读取内容" + ("；" + item.media_error if item.media_error else "") + "]"
+            body += "\n" + missing
         reply = make_reply(quote, attachment)
+        if reply is not None and missing:
+            reply.chain.append(Plain(text=missing))
         chain = [reply] if reply else [Plain(text="[引用原文；缺少有效原消息 ID]\n" + quote_text(quote))]
         chain.append(Plain(text=body))
         if attachment is not None and reply is None:
@@ -52,7 +58,7 @@ def inbound_content(item) -> tuple[str, list]:
         if item.media_kind == "file":
             body += " " + file_name(item.raw)
         if attachment is None:
-            body += " [附件未取得，无法读取内容]"
+            body += " [附件未取得，无法读取内容" + ("；" + item.media_error if item.media_error else "") + "]"
         return body, [Plain(text=body)] + ([attachment] if attachment is not None else [])
     if item.kind == 42:
         card = contact_metadata(item.raw, content)

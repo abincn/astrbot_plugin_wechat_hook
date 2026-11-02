@@ -6,11 +6,11 @@ The existing WeChat Hook DLL/HTTP server is not modified.
 from __future__ import annotations
 
 import asyncio
-import logging
 from pathlib import Path
 from urllib.parse import urlsplit
 
 import httpx
+from astrbot.api import logger as log
 from astrbot.api.platform import (
     Platform, AstrBotMessage, MessageMember, MessageType, PlatformMetadata,
     register_platform_adapter,
@@ -27,7 +27,6 @@ from .outbound import NativeTextSender
 from .components import inbound_content, mention_components
 from astrbot.core.platform.astr_message_event import current_message_event
 
-log = logging.getLogger(__name__)
 
 
 def config_switch(value, name: str) -> bool:
@@ -39,8 +38,9 @@ def config_switch(value, name: str) -> bool:
 
 
 class HookResponseError(RuntimeError):
-    def __init__(self, status_code: int, route: str, detail: str):
+    def __init__(self, status_code: int, route: str, detail: str, error_code: str = ""):
         self.status_code = status_code
+        self.error_code = error_code
         super().__init__(f"Hook {route} HTTP {status_code}: {detail[:150]}")
 
 
@@ -171,7 +171,13 @@ class WeChatHookPlatform(Platform):
         assert self._client is not None
         resp = await self._client.request(method, route, json=data)
         if resp.status_code >= 400:
-            raise HookResponseError(resp.status_code, route, resp.text)
+            error_code = ""
+            try:
+                error = resp.json()
+                error_code = error.get("error", "") if isinstance(error, dict) else ""
+            except ValueError:
+                pass
+            raise HookResponseError(resp.status_code, route, resp.text, error_code)
         payload = resp.json()
         if not isinstance(payload, (dict, list)):
             raise RuntimeError("Unexpected Hook response")
@@ -218,17 +224,17 @@ class WeChatHookPlatform(Platform):
                     try:
                         await self._poll_once()
                     except (httpx.HTTPError, ValueError, RuntimeError) as exc:
-                        log.warning("Hook polling failed; preserving cursor: %s", exc)
+                        log.warning(f"Hook polling failed; preserving cursor: {exc}")
                     try:
                         await process_pending_media(
                             self._inbox, self._request, self._client, self._media_root,
                         )
                     except Exception as exc:
-                        log.warning('Media processing failed: %s', type(exc).__name__)
+                        log.warning(f"Media processing failed: {type(exc).__name__}")
                     try:
                         await self._sender.poll_once()
                     except Exception as exc:
-                        log.warning("Text status processing failed (%s)", type(exc).__name__)
+                        log.warning(f"Text status processing failed ({type(exc).__name__})")
                     # Existing durable pending events are dispatched without sending.
                     for msg in self._inbox.pending():
                         try:
@@ -322,5 +328,5 @@ class WeChatHookPlatform(Platform):
         if native_send:
             await self._sender.send_once(record_id, room, text, mentions)
         else:
-            log.info("Draft persisted for %s; no native send was requested", room)
+            log.info(f"Draft persisted for {room}; no native send was requested")
         await super().send_by_session(session, message_chain)

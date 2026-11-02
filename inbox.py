@@ -215,8 +215,7 @@ class DurableInbox:
                                 "UPDATE inbox SET last_error='missing_media_msgsvrid' WHERE event_id=?",
                                 (message.event_id,),
                             )
-                            if message.media_kind in {"file", "voice"}:
-                                self.conn.execute("UPDATE inbox SET status='pending' WHERE event_id=?", (message.event_id,))
+                            self.conn.execute("UPDATE inbox SET status='pending' WHERE event_id=?", (message.event_id,))
                 high = max(high, seq)
             self.conn.execute("INSERT INTO cursor(name,value) VALUES('hook_after',?) "
                               "ON CONFLICT(name) DO UPDATE SET value=excluded.value", (high,))
@@ -241,7 +240,7 @@ class DurableInbox:
                        None if r["at_me"] is None else bool(r["at_me"]), r["created_at"],
                        raw, r["media_kind"], msg.media_msgsvrid if msg else "",
                        msg.media_source_talker if msg else r["sender"], r["media_path"],
-                       msg.quote_text if msg else "")
+                       msg.quote_text if msg else "", r["last_error"])
 
     def pending_media(self, limit: int = 24) -> list[dict]:
         with self._lock:
@@ -272,15 +271,16 @@ class DurableInbox:
                               "WHERE event_id=?", (detail[:250], int(time.time()), event_id))
             self.conn.execute("UPDATE inbox SET last_error=? WHERE event_id=?", (detail[:250], event_id))
 
-            # File metadata remains usable even when the native download outcome is unknown.
+            # Missing media must remain visible without replaying a native download.
             self.conn.execute("UPDATE inbox SET status='pending' WHERE event_id=? "
-                              "AND status='held_media' AND media_kind='file'", (event_id,))
+                              "AND status='held_media'", (event_id,))
 
     def media_failed(self, event_id: str, detail: str) -> None:
         with self._lock:
             self.conn.execute("UPDATE media_jobs SET status='failed',error=?,updated_at=? "
                               "WHERE event_id=?", (detail[:250], int(time.time()), event_id))
             self.conn.execute("UPDATE inbox SET last_error=? WHERE event_id=?", (detail[:250], event_id))
+            self.conn.execute("UPDATE inbox SET status='pending' WHERE event_id=? AND status='held_media'", (event_id,))
 
     def media_ready(self, event_id: str, path: str, artifact: dict) -> None:
         with self._transaction():

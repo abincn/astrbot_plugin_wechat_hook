@@ -6,6 +6,7 @@ import time
 
 import httpx
 from astrbot.api import logger
+from .contact_db import ContactDatabase
 
 
 def display_name(value) -> str:
@@ -42,6 +43,7 @@ class ContactNames:
     def __init__(self, request):
         self.request = request
         self.cache = OrderedDict()
+        self.database = ContactDatabase(self.lookup)
 
     def get(self, key):
         entry = self.cache.get(key)
@@ -82,6 +84,11 @@ class ContactNames:
                         if uid not in missing:
                             continue
                         name = display_name(field(row, "NickName", "display_name"))
+                        if name and name != uid:
+                            self.put(("user", uid), name)
+                    unresolved = sorted(uid for uid in missing if not self.get(("user", uid)))
+                    for uid, name in (await self.database.resolve(unresolved)).items():
+                        name = display_name(name)
                         if name and name != uid:
                             self.put(("user", uid), name)
                     for uid in sorted(missing):

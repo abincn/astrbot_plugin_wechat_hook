@@ -16,6 +16,7 @@ FILES = [
     "bridge.py",
     "components.py",
     "contacts.py",
+    "contact_db.py",
     "delivery.py",
     "drafts.py",
     "events.py",

@@ -19,9 +19,11 @@ FILES = [
     "inbox.py",
     "main.py",
     "outbound.py",
+    "quotes.py",
     "media.py",
     "metadata.yaml",
     "README.md",
+    "docs/MESSAGE_CAPABILITIES.md",
     "requirements.txt"
 ]
 

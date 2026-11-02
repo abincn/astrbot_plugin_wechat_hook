@@ -3,22 +3,32 @@ import hashlib
 import json
 import logging
 from pathlib import Path
+import re
 
 import httpx
+from .events import normalize_event
 
 log = logging.getLogger(__name__)
 
 MAX_IMAGE_BYTES = 12 * 1024 * 1024
+MAX_VIDEO_BYTES = 60 * 1024 * 1024
+LIMITS = {"image": MAX_IMAGE_BYTES, "video": MAX_VIDEO_BYTES}
 
 
-def save_verified_image(folder: str | Path, data: bytes, artifact: dict) -> Path:
+def save_verified_media(folder: str | Path, data: bytes, artifact: dict, kind: str) -> Path:
     size = int(artifact.get("bytes") or 0)
     digest = str(artifact.get("sha256") or "").lower()
-    if not isinstance(data, bytes) or not 0 < len(data) <= MAX_IMAGE_BYTES:
-        raise ValueError("Image size out of bounds")
+    if kind not in LIMITS or not isinstance(data, bytes) or not 0 < len(data) <= LIMITS[kind]:
+        raise ValueError("Media size out of bounds")
     if size != len(data) or len(digest) != 64 or hashlib.sha256(data).hexdigest() != digest:
-        raise ValueError("Image SHA256/size mismatch")
-    if data.startswith(b"\xff\xd8\xff"):
+        raise ValueError("Media SHA256/size mismatch")
+    if kind == "video" and len(data) > 12 and data[4:8] == b"ftyp":
+        ext = ".mp4"
+    elif kind == "video" and data.startswith(bytes.fromhex("1a45dfa3")):
+        ext = ".webm"
+    elif kind == "video":
+        raise ValueError("Unsupported video container")
+    elif data.startswith(b"\xff\xd8\xff"):
         ext = ".jpg"
     elif data.startswith(b"\x89PNG\r\n\x1a\n"):
         ext = ".png"
@@ -37,39 +47,64 @@ def save_verified_image(folder: str | Path, data: bytes, artifact: dict) -> Path
     return target
 
 
+def save_verified_image(folder: str | Path, data: bytes, artifact: dict) -> Path:
+    return save_verified_media(folder, data, artifact, "image")
+
+
+def verify_task_source(task: dict, source) -> None:
+    expected = {"kind": source.media_kind, "msgsvrid": source.media_msgsvrid,
+                "source_talker": source.media_source_talker}
+    for key, value in expected.items():
+        if key in task and str(task[key]) != value:
+            raise ValueError("Hook media source identity mismatch")
+
+
 async def process_pending_media(inbox, request, client, media_root: str | Path) -> None:
     """Advance pending Hook media tasks once; never replay an uncertain create."""
     for item in inbox.pending_media():
         event_id = item["event_id"]
-        raw = json.loads(item["raw_json"])
+        try:
+            raw = json.loads(item["raw_json"])
+            source = normalize_event(raw, item["owner"])
+        except (ValueError, TypeError) as exc:
+            inbox.media_failed(event_id, "Invalid persisted media source: " + type(exc).__name__)
+            continue
+        if source is None or source.media_kind not in LIMITS:
+            inbox.media_failed(event_id, "Unsupported media source")
+            continue
+        kind = source.media_kind
         if item["status"] == "new":
             if not inbox.begin_media(event_id):
                 continue
             try:
-                original = str(raw.get("msgsvrid") or "")
+                original = source.media_msgsvrid
                 if not original.isdecimal():
                     raise ValueError("Missing numeric msgsvrid")
                 payload = {
                     "msgsvrid": original,
-                    "source_talker": item["sender"],
-                    "kind": "image",
+                    "source_talker": source.media_source_talker,
+                    "kind": kind,
                     "download": True,
-                    "image_quality": "full",
                     "request_id": item["request_id"],
                 }
+                if kind == "image":
+                    payload["image_quality"] = "full"
                 _, response = await request("POST", "/wxcx/media/tasks", data=payload)
                 if not isinstance(response, dict):
                     raise ValueError("Hook media create response has no object")
                 task_id = str(response.get("task_id") or "")
-                if not task_id:
+                if not re.fullmatch(r"[A-Za-z0-9_-]{1,160}", task_id):
                     raise RuntimeError("Hook did not issue media task_id")
+                if isinstance(response.get("task"), dict):
+                    verify_task_source(response["task"], source)
                 inbox.media_pending(event_id, task_id)
             except Exception as exc:
                 inbox.media_unknown(event_id, type(exc).__name__)
+                log.warning("Hook media request outcome unknown for %s (%s)", event_id, type(exc).__name__)
             continue
 
         task_id = str(item.get("task_id") or "")
-        if not task_id:
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,160}", task_id):
             inbox.media_unknown(event_id, "Missing accepted task ID")
             continue
         try:
@@ -79,6 +114,7 @@ async def process_pending_media(inbox, request, client, media_root: str | Path) 
             task = response.get("task") or response
             if not isinstance(task, dict):
                 raise ValueError("Hook media task has no object")
+            verify_task_source(task, source)
             state = str(task.get("state") or "").lower()
             if state in {"failed", "error", "cancelled", "stopped"}:
                 inbox.media_failed(event_id, "Hook media state: " + state)
@@ -89,7 +125,7 @@ async def process_pending_media(inbox, request, client, media_root: str | Path) 
                 if not isinstance(artifact, dict):
                     raise ValueError("Hook media artifact has no object")
                 size = int(artifact.get("bytes") or 0)
-                if not 0 < size <= MAX_IMAGE_BYTES:
+                if not 0 < size <= LIMITS[kind]:
                     raise ValueError("Hook artifact size invalid")
                 assert client is not None
                 async with client.stream(
@@ -99,12 +135,14 @@ async def process_pending_media(inbox, request, client, media_root: str | Path) 
                     buf = bytearray()
                     async for part in content.aiter_bytes():
                         buf.extend(part)
-                        if len(buf) > MAX_IMAGE_BYTES:
-                            raise ValueError("Image exceeds size limit")
-                path = save_verified_image(media_root, bytes(buf), artifact)
+                        if len(buf) > LIMITS[kind]:
+                            raise ValueError("Media exceeds size limit")
+                path = save_verified_media(media_root, bytes(buf), artifact, kind)
                 inbox.media_ready(event_id, str(path), artifact)
+                log.info("Hook %s ready for event %s", kind, event_id)
         except (httpx.HTTPError, RuntimeError):
             # A status request can fail temporarily; keep the accepted task pending.
             log.warning("Media task status/content currently unavailable for %s", event_id)
         except (ValueError, KeyError, TypeError) as exc:
             inbox.media_failed(event_id, str(exc))
+            log.warning("Hook %s media failed for %s: %s", kind, event_id, exc)

@@ -3,6 +3,8 @@
 独立的 AstrBot 连接插件：连接现有 PC WeChat Hook，转换群消息、持久化 Inbox，并把 AstrBot 回复保存为草稿。
 群 Agent 名单、按群指令和模型工具策略由 Agent 插件管理。
 
+图片、视频和入站引用的能力边界见 [AstrBot / Hook / 连接插件对比表](docs/MESSAGE_CAPABILITIES.md)。
+
 **默认只保存草稿。** 在平台设置中打开“允许真实发送”后，新产生的入站消息回复可以提交给 Hook 发送文本或群 @。
 不支持主动/无来源消息、图片、文件、语音、原生引用或 @全体；历史草稿不会自动发送。
 任务编排和任务工作台由另一个仓库提供：[微信 Agent 任务插件](https://github.com/abincn/astrbot_plugin_wechat_agents)。
@@ -79,6 +81,21 @@ https://github.com/abincn/astrbot_plugin_wechat_hook
 Hook 的 request_id 去重只有进程内有效，因此插件不会依赖 Hook 重启后的去重来自动重发。
 认证失败或结果未知时，先人工核对，再用新的入站消息触发新回复。
 
+### 图片、视频与引用消息接收（v0.3.1）
+
+支持下载并校验图片（12 MiB）和视频（60 MiB），分别转换成 AstrBot `Image` / `Video`。
+引用文字转换为 `Reply`；引用图片/视频使用原引用源的 ID 和发送者下载，放入引用链。
+缺少有效引用 ID 时保留明确标记的文字回退，不伪造原消息 ID。
+
+文件校验包括大小、SHA-256 与图片/视频格式；支持 JPEG/PNG/GIF/WebP 及 MP4/WebM。
+失败或结果不确定的媒体不会交给模型，也不会自动重新创建下载任务。
+升级后请发送新消息观察 `Hook image/video ready` 日志；已有 held/unknown/failed 记录不自动回放。
+
+接收到 Video 不等于模型看到了画面。旧 Group Agents 的视频分析还包括 ffmpeg 抽帧，
+该能力由 [Agent 插件](https://github.com/abincn/astrbot_plugin_wechat_agents) 的“视频抽帧分析”开关提供。
+不安装 Agent 也能接收到媒体组件，后续理解依赖 AstrBot 自身或其他插件。
+语音、普通文件、表情等类型仍有未接入部分，详见对比表。
+
 ## 与 Agent 插件配合
 
 连接插件不导入 Agent、不注册任务页面、不创建任务或启动 Worker。
@@ -115,6 +132,6 @@ python tools/package_plugin.py
 
 ## 当前验证范围
 
-v0.3.0 将群策略移到 Agent 插件，并接入可选真实文本发送与布尔控件。仅进行语法检查、静态核对和 ZIP 构建，
+v0.3.1 补媒体与入站引用接收；v0.3.0 将群策略移到 Agent 并接入可选文本发送与布尔控件。仅进行语法检查、静态核对和 ZIP 构建，
 没有编写测试代码或运行本地测试，也没有部署到生产或连接真实微信/模型。
 真实发送路径尚未实机验证；没有对端收件回执、自动重试、主动推送、私聊发送或多进程恢复。

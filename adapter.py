@@ -16,7 +16,7 @@ from astrbot.api.platform import (
     register_platform_adapter,
 )
 from astrbot.api.event import AstrMessageEvent, MessageChain
-from astrbot.api.message_components import At, Plain, Image
+from astrbot.api.message_components import At, Plain, Image, Video
 from .events import Inbound
 from .identity import split_session
 from .inbox import DurableInbox
@@ -24,6 +24,7 @@ from .media import process_pending_media
 from .delivery import attach_pipeline_ack
 from .drafts import source_draft_identity
 from .outbound import NativeTextSender
+from .quotes import make_reply, quote_text
 from astrbot.core.platform.astr_message_event import current_message_event
 
 log = logging.getLogger(__name__)
@@ -147,13 +148,28 @@ class WeChatHookPlatform(Platform):
         obj.sender = MessageMember(user_id=item.sender, nickname=item.sender)
         obj.session_id = item.session_id
         obj.message_id = item.event_id
-        obj.message_str = "[图片]" if item.media_path else item.content
+        obj.message_str = ("[视频]" if item.media_kind == "video" else "[图片]") if item.media_path else item.content
+        quote = item.quote
+        if quote is not None:
+            obj.message_str = str(quote.get("reply_text") or "")[:4500] or "[引用回复]"
         obj.timestamp = item.created_at
         obj.raw_message = item.raw
         # Only native Hook explicit @ metadata counts. Never infer @ from plain text.
-        obj.message = ([At(qq=item.owner)] if item.at_me is True else []) + [Plain(text=obj.message_str)]
+        obj.message = [At(qq=item.owner)] if item.at_me is True else []
+        attachment = None
         if item.media_path:
-            obj.message.append(Image.fromFileSystem(item.media_path))
+            component = Video if item.media_kind == "video" else Image
+            attachment = component.fromFileSystem(item.media_path)
+        if quote is not None:
+            reply = make_reply(quote, attachment)
+            if reply is not None:
+                obj.message.append(reply)
+                attachment = None
+            else:
+                obj.message.append(Plain(text="[引用原文；缺少有效原消息 ID]\n" + quote_text(quote)))
+        obj.message.append(Plain(text=obj.message_str))
+        if attachment is not None:
+            obj.message.append(attachment)
         return obj
 
     def create_event(self, message: AstrBotMessage) -> AstrMessageEvent:

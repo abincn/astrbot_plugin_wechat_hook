@@ -29,6 +29,14 @@ class Inbound:
     def session_id(self) -> str:
         return group_session(self.owner, self.room)
 
+    @property
+    def quote(self) -> dict | None:
+        metadata = self.raw.get("source_meta")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        kind = self.raw.get("message_kind") or metadata.get("message_kind")
+        quote = self.raw.get("quote")
+        return quote if self.kind == 49 and kind == "quote" and isinstance(quote, dict) else None
+
 
 def normalize_event(event: dict, self_wxid: str) -> Inbound | None:
     """Accept only explicitly incoming group events; never infer a native @ from text."""

@@ -188,7 +188,8 @@ class DurableInbox:
                     raw = json.dumps(item, ensure_ascii=False, separators=(",", ":"))
                     if len(raw.encode("utf-8")) > 96000:
                         raise ValueError("Hook event metadata exceeds 96KB (cursor not advanced)")
-                    state = "pending" if message.kind == 1 else "held_media"
+                    text_ready = message.kind == 1 or (message.quote is not None and not message.media_kind)
+                    state = "pending" if text_ready else "held_media"
                     res = self.conn.execute("""
                         INSERT OR IGNORE INTO inbox
                         (event_id,sequence,owner,room,sender,content,kind,at_me,
@@ -201,12 +202,17 @@ class DurableInbox:
                           message.media_kind, ""))
                     if res.rowcount > 0:
                         inserted += 1
-                        if message.media_kind == "image" and message.media_msgsvrid.isdecimal():
-                            request_id = "astrbot-image-" + stable_hash([message.event_id])[:32]
+                        if message.media_kind in {"image", "video"} and message.media_msgsvrid.isdecimal():
+                            request_id = "astrbot-media-" + stable_hash([message.event_id])[:32]
                             self.conn.execute("""
                                 INSERT OR IGNORE INTO media_jobs(event_id,request_id,status,updated_at)
                                 VALUES(?,?,?,?)
                             """, (message.event_id, request_id, "new", int(time.time())))
+                        elif message.media_kind in {"image", "video"}:
+                            self.conn.execute(
+                                "UPDATE inbox SET last_error='missing_media_msgsvrid' WHERE event_id=?",
+                                (message.event_id,),
+                            )
                 high = max(high, seq)
             self.conn.execute("INSERT INTO cursor(name,value) VALUES('hook_after',?) "
                               "ON CONFLICT(name) DO UPDATE SET value=excluded.value", (high,))
@@ -236,7 +242,7 @@ class DurableInbox:
     def pending_media(self, limit: int = 24) -> list[dict]:
         with self._lock:
             rows = self.conn.execute("""
-                SELECT i.event_id,i.owner,i.room,i.sender,i.kind,i.raw_json,
+                SELECT i.event_id,i.owner,i.room,i.sender,i.kind,i.media_kind,i.raw_json,
                        j.request_id,j.task_id,j.status,j.error
                 FROM inbox i JOIN media_jobs j ON j.event_id=i.event_id
                 WHERE j.status IN ('new','pending')
@@ -260,6 +266,7 @@ class DurableInbox:
         with self._lock:
             self.conn.execute("UPDATE media_jobs SET status='unknown',error=?,updated_at=? "
                               "WHERE event_id=?", (detail[:250], int(time.time()), event_id))
+            self.conn.execute("UPDATE inbox SET last_error=? WHERE event_id=?", (detail[:250], event_id))
 
     def media_failed(self, event_id: str, detail: str) -> None:
         with self._lock:

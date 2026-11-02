@@ -59,7 +59,9 @@ def inbound_content(item) -> tuple[str, list]:
             body += " " + file_name(item.raw)
         if attachment is None:
             body += " [附件未取得，无法读取内容" + ("；" + item.media_error if item.media_error else "") + "]"
-        return body, [Plain(text=body)] + ([attachment] if attachment is not None else [])
+        # Keep message_str as the model caption; the component already renders
+        # its media label in AstrBot logs, so don't add a duplicate Plain label.
+        return body, [attachment] if attachment is not None else [Plain(text=body)]
     if item.kind == 42:
         card = contact_metadata(item.raw, content)
         body = "[微信名片]\n" + ("\n".join(f"{key}: {value}" for key, value in card.items() if value) or "[名片字段不可读取]")

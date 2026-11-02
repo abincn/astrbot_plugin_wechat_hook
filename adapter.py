@@ -25,6 +25,8 @@ from .delivery import attach_pipeline_ack
 from .drafts import source_draft_identity
 from .outbound import NativeTextSender
 from .components import inbound_content, mention_components
+from .video_inputs import VideoInputs
+from .contacts import ContactNames
 from astrbot.core.platform.astr_message_event import current_message_event
 
 
@@ -74,6 +76,7 @@ class HookMessageEvent(AstrMessageEvent):
         "poll_interval": 2.0,
         "send_enabled": False,
         "capture_enabled": False,
+        "video_frames_enabled": True,
     },
     support_streaming_message=False,
     adapter_display_name="微信 Hook 连接",
@@ -86,6 +89,7 @@ class HookMessageEvent(AstrMessageEvent):
         "poll_interval": {"type": "float", "description": "轮询间隔（秒）"},
         "send_enabled": {"type": "bool", "description": "允许真实发送", "hint": "开启后，新回复会提交给微信 Hook；历史草稿不会发送。"},
         "capture_enabled": {"type": "bool", "description": "自动开启 Hook 消息采集", "hint": "默认关闭，避免改动现有采集配置。"},
+        "video_frames_enabled": {"type": "bool", "description": "视频抽帧分析", "hint": "群聊、私聊和引用视频共用。需要本机 ffmpeg 和视觉模型；最多约 0、3、9 秒三帧，不分析音轨。"},
     },
 )
 class WeChatHookPlatform(Platform):
@@ -95,8 +99,9 @@ class WeChatHookPlatform(Platform):
         self._enabled = config_switch(self.config.get("enable", False), "enable")
         self.send_enabled = config_switch(self.config.get("send_enabled", False), "send_enabled")
         self.capture_enabled = config_switch(self.config.get("capture_enabled", False), "capture_enabled")
+        self.video_frames_enabled = config_switch(self.config.get("video_frames_enabled", True), "video_frames_enabled")
         self.config.update(enable=self._enabled, send_enabled=self.send_enabled,
-                           capture_enabled=self.capture_enabled)
+                           capture_enabled=self.capture_enabled, video_frames_enabled=self.video_frames_enabled)
         self.url = str(self.config.get("hook_url") or "http://127.0.0.1:30001").rstrip("/")
         endpoint = urlsplit(self.url)
         if (endpoint.scheme != 'http' or endpoint.hostname not in {'127.0.0.1', 'localhost', '::1'}
@@ -109,9 +114,11 @@ class WeChatHookPlatform(Platform):
         self._inbox.reconcile_interrupted_pipeline()
         self._stopping = asyncio.Event()
         self._media_root = Path(str(self.config.get('inbox_db') or 'data/wechat_hook_inbox.sqlite3')).resolve().parent / 'media'
+        self._video_inputs = VideoInputs(self._media_root)
         self._client: httpx.AsyncClient | None = None
         self._task_runtime = None
         self._sender = NativeTextSender(self._inbox, self._request, self.owner)
+        self._contacts = ContactNames(self._request)
         self._meta = PlatformMetadata(
             name="wechat_pc_hook", description="PC WeChat Hook with persistent inbound audit",
             id=str(self.config.get("id") or "wechat_pc_hook"),
@@ -120,6 +127,10 @@ class WeChatHookPlatform(Platform):
 
     def meta(self) -> PlatformMetadata:
         return self._meta
+
+    async def prepare_video_input(self, event, req) -> None:
+        if self.video_frames_enabled and not self._stopping.is_set():
+            await self._video_inputs.apply(event, req)
 
     def get_task_scope(self) -> dict:
         """Versioned, data-only binding for an optional task plugin."""
@@ -236,7 +247,8 @@ class WeChatHookPlatform(Platform):
                     except Exception as exc:
                         log.warning(f"Text status processing failed ({type(exc).__name__})")
                     # Existing durable pending events are dispatched without sending.
-                    for msg in self._inbox.pending():
+                    pending = await self._contacts.resolve(self._inbox.pending())
+                    for msg in pending:
                         try:
                             event = self.to_event(msg)
                             # Reserve durable state before commit_event's put_nowait.

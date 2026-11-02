@@ -52,7 +52,7 @@ https://github.com/abincn/astrbot_plugin_wechat_hook
 - `self_wxid` 是微信内部账号 ID，不是昵称或手机号。
 - 不再配置 `allowed_rooms`。旧配置残留的该字段会被忽略；本连接器接收当前账号的入站群聊和私聊。
 - `hook_token` 必须与 Hook 服务的访问令牌一致；HTTP 401 表示鉴权被拒绝。
-- `hook_url` 目前仅接受本机回环 HTTP 地址，Hook 应与 AstrBot 运行在同一台电脑。
+- `hook_url` 填 HTTP(S) 地址和端口，不附加 `/wxcx` 或接口路径。默认只允许回环地址；跨主机连接须开启“允许远程 Hook”并填写令牌。
 - 默认不更改 Hook 的采集配置或回调地址。先用现有 Hook 控制方式确认采集已启用。
 - 为此独立实例使用自己的数据库，不与生产接收器共用游标。
 
@@ -190,7 +190,7 @@ Docker 应把正确的 Linux 包安装到 AstrBot 容器内；可执行文件所
 ffmpeg 在容器内运行，不能靠只给宿主机安装 Windows exe 或 ffmpeg 来替代。
 
 微信 PC Hook DLL 仍运行在 Windows；Linux 不加载 DLL。媒体经 Hook HTTP 下载到 Linux 的本地 Inbox/媒体目录，无需共享 Windows 文件路径。
-目前 `hook_url` 仍只允许回环 HTTP，可将 Windows Hook 隧道转发到 Linux 的 `127.0.0.1:30001`。
+默认只允许回环地址，可将 Windows Hook 隧道转发到 Linux 的 `127.0.0.1:30001`。
 例如从 Windows 发起反向 SSH 隧道（需已有 SSH 服务和登录权限）：
 
 ```text
@@ -200,6 +200,22 @@ ssh -N -R 127.0.0.1:30001:127.0.0.1:30001 linux_user@linux_host
 随后 Linux 插件继续使用 `http://127.0.0.1:30001`，`hook_token` 与 Windows Hook 一致。
 Docker 的回环地址属于容器自身；可使用 Linux 的 host 网络模式，或让隧道与 AstrBot 位于同一网络命名空间。
 本仓库不自动建立隧道、不改变 Hook 监听地址或鉴权。配置持久化 Inbox、插件目录及 AstrBot ASR/模型配置后重启。
+
+### 直接连接远程 Hook（v0.6.2）
+
+Linux / Docker 需要直接连接另一台 Windows 时，在 **消息平台 → 微信 Hook 连接 → 编辑**：
+
+1. 开启“允许远程 Hook”（`allow_remote_hook`，布尔控件，默认关闭）。
+2. 地址填写 Windows 主机可达的 HTTP(S) 地址和端口，例如 `http://192.168.1.10:30001`。
+3. 填写与该 Hook 一致的 `hook_token`；远程连接不接受空令牌。
+4. 保存并完整重启 AstrBot。
+
+地址仅含协议、主机及端口，不带 `/wxcx/messages` 等路径，不在地址中附加 token、用户名、密码或查询参数。
+使用可信内网/VPN或HTTPS；HTTPS 保持证书校验，不自动忽略证书错误。
+容器里的 `127.0.0.1` 仍指向容器本身，不能用它代替 Windows 的地址。
+Windows Hook 必须已监听容器/服务器可达的地址，并允许该来源连接；此开关只放开插件的目标校验，
+不修改 Windows 监听地址、防火墙或 Hook 端访问控制。若 Hook 仅监听回环或拒绝远端请求，请继续使用隧道。
+插件继续使用 `X-Wxcx-Token` 请求头，不跟随重定向，不把令牌写入日志。收发、媒体及联系人查询共用该连接。
 
 ### 服务推送不自动回复（v0.6.1）
 
@@ -264,6 +280,6 @@ python tools/package_plugin.py
 
 ## 当前验证范围
 
-v0.6.1 将已识别的服务推送保留为通知并禁止自动回复；v0.6.0 的媒体处理和内置 ffmpeg 保留。仅进行语法检查、静态核对和 ZIP 构建，
+v0.6.2 增加显式远程 Hook 开关及令牌校验；服务推送过滤、媒体处理和内置 ffmpeg 保留。仅进行语法检查、静态核对和 ZIP 构建，
 没有编写测试代码或运行本地测试，也没有部署到生产或连接真实微信/模型。
 真实收发路径尚未实机验证；没有对端收件回执、自动重试、主动推送、媒体/卡片发送或多进程恢复。

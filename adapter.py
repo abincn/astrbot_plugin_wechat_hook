@@ -6,6 +6,7 @@ The existing WeChat Hook DLL/HTTP server is not modified.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -72,6 +73,7 @@ class HookMessageEvent(AstrMessageEvent):
         "enable": False,
         "hook_url": "http://127.0.0.1:30001",
         "hook_token": "",
+        "allow_remote_hook": False,
         "self_wxid": "",
         "inbox_db": "data/wechat_hook_inbox.sqlite3",
         "poll_interval": 2.0,
@@ -86,6 +88,7 @@ class HookMessageEvent(AstrMessageEvent):
         "enable": {"type": "bool", "description": "启用连接"},
         "hook_url": {"type": "string", "description": "Hook 地址"},
         "hook_token": {"type": "string", "description": "Hook 访问令牌", "secret": True},
+        "allow_remote_hook": {"type": "bool", "description": "允许远程 Hook", "hint": "Linux/Docker 跨主机连接时开启，必须填写令牌。仅使用可信网络/VPN或HTTPS；不会改变Windows Hook监听设置。"},
         "self_wxid": {"type": "string", "description": "登录微信的 wxid"},
         "inbox_db": {"type": "string", "description": "消息数据库路径"},
         "poll_interval": {"type": "float", "description": "轮询间隔（秒）"},
@@ -102,17 +105,35 @@ class WeChatHookPlatform(Platform):
         self._enabled = config_switch(self.config.get("enable", False), "enable")
         self.send_enabled = config_switch(self.config.get("send_enabled", False), "send_enabled")
         self.capture_enabled = config_switch(self.config.get("capture_enabled", False), "capture_enabled")
+        self.allow_remote_hook = config_switch(self.config.get("allow_remote_hook", False), "allow_remote_hook")
         self.video_frames_enabled = config_switch(self.config.get("video_frames_enabled", True), "video_frames_enabled")
         self.video_audio_enabled = config_switch(self.config.get("video_audio_enabled", True), "video_audio_enabled")
         self.config.update(enable=self._enabled, send_enabled=self.send_enabled,
                            capture_enabled=self.capture_enabled, video_frames_enabled=self.video_frames_enabled,
-                           video_audio_enabled=self.video_audio_enabled)
-        self.url = str(self.config.get("hook_url") or "http://127.0.0.1:30001").rstrip("/")
-        endpoint = urlsplit(self.url)
-        if (endpoint.scheme != 'http' or endpoint.hostname not in {'127.0.0.1', 'localhost', '::1'}
-                or endpoint.username or endpoint.password or endpoint.path or endpoint.query or endpoint.fragment):
-            raise ValueError('hook_url must be a bare loopback HTTP origin')
-        self.token = str(self.config.get("hook_token") or "")
+                           video_audio_enabled=self.video_audio_enabled, allow_remote_hook=self.allow_remote_hook)
+        self.url = str(self.config.get("hook_url") or "http://127.0.0.1:30001").strip().rstrip("/")
+        self.token = str(self.config.get("hook_token") or "").strip()
+        try:
+            endpoint = urlsplit(self.url)
+            if (endpoint.scheme not in {'http', 'https'} or not endpoint.hostname
+                    or endpoint.username is not None or endpoint.password is not None
+                    or endpoint.path or endpoint.query or endpoint.fragment
+                    or any(ch.isspace() or ord(ch) < 32 for ch in self.url)
+                    or endpoint.port is not None and not 1 <= endpoint.port <= 65535):
+                raise ValueError("invalid origin")
+        except ValueError as exc:
+            raise ValueError("hook_url must be an HTTP(S) origin such as http://192.168.1.10:30001; omit API paths, credentials and query parameters") from exc
+        hostname = endpoint.hostname.lower().rstrip(".")
+        is_loopback = hostname == 'localhost'
+        try:
+            is_loopback = is_loopback or ipaddress.ip_address(hostname).is_loopback
+        except ValueError:
+            pass
+        if not is_loopback:
+            if not self.allow_remote_hook:
+                raise ValueError("Enable '允许远程 Hook' (allow_remote_hook) to connect to another host, or use a loopback tunnel")
+            if not self.token:
+                raise ValueError("Remote Hook connections require hook_token")
         self.interval = max(0.5, float(self.config.get("poll_interval") or 2))
         self._inbox = DurableInbox(Path(str(self.config.get("inbox_db") or "data/wechat_hook_inbox.sqlite3")))
         self._inbox.reconcile_interrupted_media()
@@ -235,7 +256,7 @@ class WeChatHookPlatform(Platform):
                 raise RuntimeError("Set self_wxid before enabling this adapter")
             headers = {"X-Wxcx-Token": self.token} if self.token else {}
             async with httpx.AsyncClient(
-                base_url=self.url, headers=headers, timeout=8, trust_env=False,
+                base_url=self.url, headers=headers, timeout=8, trust_env=False, follow_redirects=False,
             ) as client:
                 self._client = client
                 if self.capture_enabled:

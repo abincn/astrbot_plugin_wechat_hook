@@ -25,8 +25,6 @@ FILES = [
     "payloads.py",
     "quotes.py",
     "media.py",
-    "video_frames.py",
-    "video_inputs.py",
     "metadata.yaml",
     "README.md",
     "docs/MESSAGE_CAPABILITIES.md",

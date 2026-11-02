@@ -1,10 +1,10 @@
-"""Normalize raw Hook payloads into validated inbound group messages."""
+"""Normalize explicitly incoming Hook group and private messages."""
 from __future__ import annotations
 
 import time
 from dataclasses import dataclass
 
-from .identity import group_session, stable_hash
+from .identity import conversation_session, stable_hash
 
 @dataclass(frozen=True)
 class Inbound:
@@ -27,7 +27,11 @@ class Inbound:
 
     @property
     def session_id(self) -> str:
-        return group_session(self.owner, self.room)
+        return conversation_session(self.owner, self.room)
+
+    @property
+    def is_group(self) -> bool:
+        return self.raw.get("is_group") is True
 
     @property
     def quote(self) -> dict | None:
@@ -39,23 +43,29 @@ class Inbound:
 
 
 def normalize_event(event: dict, self_wxid: str) -> Inbound | None:
-    """Accept only explicitly incoming group events; never infer a native @ from text."""
+    """Require explicit direction and conversation identity; don't infer @ from text."""
     if not isinstance(event, dict):
         raise ValueError("Hook event must be a JSON object")
-    if event.get("event_type", "message") != "message":
+    if event.get("event_type", "message") not in ("message", "file_transfer"):
         return None
-    if event.get("direction") != "incoming" or event.get("is_group") is not True:
+    if event.get("direction") != "incoming" or type(event.get("is_group")) is not bool:
         return None
-    room = str(event.get("room_id") or event.get("conversation_id") or "")
-    if not room.endswith("@chatroom"):
+    is_group = event["is_group"]
+    room = str((event.get("room_id") or event.get("conversation_id")) if is_group
+               else event.get("conversation_id") or "")
+    if is_group and not room.endswith("@chatroom"):
         return None
     owner = str(event.get("self_id") or self_wxid or "")
     if not owner or (self_wxid and owner != self_wxid):
         raise ValueError("Hook self_id missing or differs from configured account")
     sender = str(event.get("sender_id") or "")
+    if event.get("type") in (10000, 10002, "10000", "10002") and is_group and (not sender or sender == room):
+        sender = "wechat_system"
     if not sender or sender.endswith("@chatroom") or sender == owner:
         return None
-    group_session(owner, room)
+    if not is_group and (room != sender or event.get("room_id")):
+        return None
+    conversation_session(owner, room)
     sequence = event.get("sequence", event.get("seq", 0))
     if type(sequence) not in (int, str) or not str(sequence).isdigit():
         raise ValueError("Hook sequence is not a nonnegative integer")
@@ -66,7 +76,7 @@ def normalize_event(event: dict, self_wxid: str) -> Inbound | None:
         kind = int(event.get("type") or 0)
     except (TypeError, ValueError) as exc:
         raise ValueError("Hook message type is invalid") from exc
-    if kind not in (1, 3, 34, 43, 47, 49):
+    if not 0 < kind <= 0xFFFFFFFF:
         return None
 
     text = str(event.get("content") or event.get("raw_content") or "")[:30000]
@@ -79,7 +89,7 @@ def normalize_event(event: dict, self_wxid: str) -> Inbound | None:
     source_meta = event.get("source_meta") if isinstance(event.get("source_meta"), dict) else {}
     message_kind = str(event.get("message_kind") or source_meta.get("message_kind") or "")
     quote = event.get("quote") if isinstance(event.get("quote"), dict) else {}
-    media_kind = "image" if kind == 3 else "video" if kind == 43 else ""
+    media_kind = {3: "image", 43: "video", 34: "voice", 47: "emoji"}.get(kind, "")
     media_msgsvrid = str(event.get("msgsvrid") or "")
     media_source_talker = sender
     if kind == 49 and message_kind == "file_card":
@@ -93,7 +103,8 @@ def normalize_event(event: dict, self_wxid: str) -> Inbound | None:
 
     event_id = str(event.get("event_id") or "")
     if not event_id:
-        stable = media_msgsvrid if media_msgsvrid.isdecimal() else str(sequence) + ":" + text
+        outer_id = str(event.get("msgsvrid") or "")
+        stable = outer_id if outer_id.isdecimal() else str(sequence) + ":" + text
         event_id = "hook:" + stable_hash([owner, room, sender, stable, str(kind)])
     if len(event_id) > 220:
         raise ValueError("Hook event ID exceeds limit")

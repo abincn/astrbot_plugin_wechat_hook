@@ -7,22 +7,28 @@ import re
 
 import httpx
 from .events import normalize_event
+from .extra_media import download_voice, download_emoji
 
 log = logging.getLogger(__name__)
 
 MAX_IMAGE_BYTES = 12 * 1024 * 1024
 MAX_VIDEO_BYTES = 60 * 1024 * 1024
-LIMITS = {"image": MAX_IMAGE_BYTES, "video": MAX_VIDEO_BYTES}
+LIMITS = {"image": MAX_IMAGE_BYTES, "video": MAX_VIDEO_BYTES, "file": 24 * 1024 * 1024}
 
 
 def save_verified_media(folder: str | Path, data: bytes, artifact: dict, kind: str) -> Path:
     size = int(artifact.get("bytes") or 0)
     digest = str(artifact.get("sha256") or "").lower()
-    if kind not in LIMITS or not isinstance(data, bytes) or not 0 < len(data) <= LIMITS[kind]:
+    if (kind not in LIMITS or not isinstance(data, bytes) or len(data) > LIMITS[kind]
+            or (not data and kind != "file")):
         raise ValueError("Media size out of bounds")
     if size != len(data) or len(digest) != 64 or hashlib.sha256(data).hexdigest() != digest:
         raise ValueError("Media SHA256/size mismatch")
-    if kind == "video" and len(data) > 12 and data[4:8] == b"ftyp":
+    if kind == "file":
+        suffix = str(artifact.get("extension") or "").lower().lstrip(".")
+        allowed = {"txt", "md", "csv", "json", "log", "xml", "pdf", "docx", "xlsx", "pptx", "doc", "xls", "ppt"}
+        ext = "." + suffix if suffix in allowed else ".bin"
+    elif kind == "video" and len(data) > 12 and data[4:8] == b"ftyp":
         ext = ".mp4"
     elif kind == "video" and data.startswith(bytes.fromhex("1a45dfa3")):
         ext = ".webm"
@@ -69,10 +75,24 @@ async def process_pending_media(inbox, request, client, media_root: str | Path) 
         except (ValueError, TypeError) as exc:
             inbox.media_failed(event_id, "Invalid persisted media source: " + type(exc).__name__)
             continue
-        if source is None or source.media_kind not in LIMITS:
+        if source is None or source.media_kind not in {*LIMITS, "voice", "emoji"}:
             inbox.media_failed(event_id, "Unsupported media source")
             continue
         kind = source.media_kind
+        if kind in {"voice", "emoji"}:
+            if item["status"] != "new" or not inbox.begin_media(event_id):
+                continue
+            try:
+                if kind == "voice":
+                    path, artifact = await download_voice(client, source, media_root)
+                else:
+                    path, artifact = await download_emoji(source, media_root, save_verified_image)
+                inbox.media_ready(event_id, str(path), artifact)
+                log.info("Hook %s ready for event %s", kind, event_id)
+            except (httpx.HTTPError, ValueError, TypeError, OSError) as exc:
+                inbox.media_unavailable(event_id, f"{kind}_unavailable: {type(exc).__name__}")
+                log.warning("Hook %s unavailable for event %s (%s)", kind, event_id, type(exc).__name__)
+            continue
         if item["status"] == "new":
             if not inbox.begin_media(event_id):
                 continue
@@ -117,7 +137,8 @@ async def process_pending_media(inbox, request, client, media_root: str | Path) 
             verify_task_source(task, source)
             state = str(task.get("state") or "").lower()
             if state in {"failed", "error", "cancelled", "stopped"}:
-                inbox.media_failed(event_id, "Hook media state: " + state)
+                failed = inbox.media_unavailable if kind == "file" else inbox.media_failed
+                failed(event_id, "Hook media state: " + state)
             elif state in {"unknown", "result_unknown", "timed_out", "timeout", "account_changed"}:
                 inbox.media_unknown(event_id, "Hook media state: " + state)
             elif state == "ready":
@@ -125,7 +146,7 @@ async def process_pending_media(inbox, request, client, media_root: str | Path) 
                 if not isinstance(artifact, dict):
                     raise ValueError("Hook media artifact has no object")
                 size = int(artifact.get("bytes") or 0)
-                if not 0 < size <= LIMITS[kind]:
+                if not (0 <= size <= LIMITS[kind]) or (size == 0 and kind != "file"):
                     raise ValueError("Hook artifact size invalid")
                 assert client is not None
                 async with client.stream(
@@ -144,5 +165,6 @@ async def process_pending_media(inbox, request, client, media_root: str | Path) 
             # A status request can fail temporarily; keep the accepted task pending.
             log.warning("Media task status/content currently unavailable for %s", event_id)
         except (ValueError, KeyError, TypeError) as exc:
-            inbox.media_failed(event_id, str(exc))
+            failed = inbox.media_unavailable if kind == "file" else inbox.media_failed
+            failed(event_id, str(exc))
             log.warning("Hook %s media failed for %s: %s", kind, event_id, exc)

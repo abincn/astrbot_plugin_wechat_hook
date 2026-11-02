@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Iterator
 
 from .events import Inbound, normalize_event
-from .identity import group_session, stable_hash
+from .identity import conversation_session, group_session, stable_hash
 
 class DurableInbox:
     """A single adapter instance owns a database and Hook cursor."""
@@ -188,7 +188,7 @@ class DurableInbox:
                     raw = json.dumps(item, ensure_ascii=False, separators=(",", ":"))
                     if len(raw.encode("utf-8")) > 96000:
                         raise ValueError("Hook event metadata exceeds 96KB (cursor not advanced)")
-                    text_ready = message.kind == 1 or (message.quote is not None and not message.media_kind)
+                    text_ready = not message.media_kind
                     state = "pending" if text_ready else "held_media"
                     res = self.conn.execute("""
                         INSERT OR IGNORE INTO inbox
@@ -202,17 +202,21 @@ class DurableInbox:
                           message.media_kind, ""))
                     if res.rowcount > 0:
                         inserted += 1
-                        if message.media_kind in {"image", "video"} and message.media_msgsvrid.isdecimal():
+                        if (message.media_kind == "emoji" or
+                                message.media_kind in {"image", "video", "file", "voice"}
+                                and message.media_msgsvrid.isdecimal()):
                             request_id = "astrbot-media-" + stable_hash([message.event_id])[:32]
                             self.conn.execute("""
                                 INSERT OR IGNORE INTO media_jobs(event_id,request_id,status,updated_at)
                                 VALUES(?,?,?,?)
                             """, (message.event_id, request_id, "new", int(time.time())))
-                        elif message.media_kind in {"image", "video"}:
+                        elif message.media_kind in {"image", "video", "file", "voice"}:
                             self.conn.execute(
                                 "UPDATE inbox SET last_error='missing_media_msgsvrid' WHERE event_id=?",
                                 (message.event_id,),
                             )
+                            if message.media_kind in {"file", "voice"}:
+                                self.conn.execute("UPDATE inbox SET status='pending' WHERE event_id=?", (message.event_id,))
                 high = max(high, seq)
             self.conn.execute("INSERT INTO cursor(name,value) VALUES('hook_after',?) "
                               "ON CONFLICT(name) DO UPDATE SET value=excluded.value", (high,))
@@ -268,6 +272,10 @@ class DurableInbox:
                               "WHERE event_id=?", (detail[:250], int(time.time()), event_id))
             self.conn.execute("UPDATE inbox SET last_error=? WHERE event_id=?", (detail[:250], event_id))
 
+            # File metadata remains usable even when the native download outcome is unknown.
+            self.conn.execute("UPDATE inbox SET status='pending' WHERE event_id=? "
+                              "AND status='held_media' AND media_kind='file'", (event_id,))
+
     def media_failed(self, event_id: str, detail: str) -> None:
         with self._lock:
             self.conn.execute("UPDATE media_jobs SET status='failed',error=?,updated_at=? "
@@ -280,6 +288,13 @@ class DurableInbox:
                               "WHERE event_id=?", (json.dumps(artifact, ensure_ascii=False), int(time.time()), event_id))
             self.conn.execute("UPDATE inbox SET status='pending',media_path=?,last_error='' "
                               "WHERE event_id=? AND status='held_media'", (path, event_id))
+
+    def media_unavailable(self, event_id: str, detail: str) -> None:
+        """Dispatch metadata with an explicit missing attachment, never raw XML."""
+        with self._transaction():
+            self.media_failed(event_id, detail)
+            self.conn.execute("UPDATE inbox SET status='pending' WHERE event_id=? AND status='held_media'",
+                              (event_id,))
 
     def mark_dispatched(self, event_id: str) -> bool:
         with self._lock:
@@ -305,7 +320,7 @@ class DurableInbox:
         a historical draft is never promoted automatically.
         A stable intent_id belongs to one logical reply, not merely a text hash.
         """
-        group_session(owner, room)
+        conversation_session(owner, room)
         if intent_id and (len(intent_id) > 128 or len(source_event_id) > 220
                           or not source_event_id):
             raise ValueError("Invalid outbound intent metadata")

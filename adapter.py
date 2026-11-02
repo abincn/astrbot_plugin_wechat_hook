@@ -16,7 +16,7 @@ from astrbot.api.platform import (
     register_platform_adapter,
 )
 from astrbot.api.event import AstrMessageEvent, MessageChain
-from astrbot.api.message_components import At, Plain, Image, Video
+from astrbot.api.message_components import At, Plain
 from .events import Inbound
 from .identity import split_session
 from .inbox import DurableInbox
@@ -24,7 +24,7 @@ from .media import process_pending_media
 from .delivery import attach_pipeline_ack
 from .drafts import source_draft_identity
 from .outbound import NativeTextSender
-from .quotes import make_reply, quote_text
+from .components import inbound_content, mention_components
 from astrbot.core.platform.astr_message_event import current_message_event
 
 log = logging.getLogger(__name__)
@@ -142,34 +142,19 @@ class WeChatHookPlatform(Platform):
 
     def to_astrbot(self, item: Inbound) -> AstrBotMessage:
         obj = AstrBotMessage()
-        obj.type = MessageType.GROUP_MESSAGE
+        obj.type = MessageType.GROUP_MESSAGE if item.is_group else MessageType.FRIEND_MESSAGE
         obj.self_id = item.owner
-        obj.group_id = item.room
-        obj.sender = MessageMember(user_id=item.sender, nickname=item.sender)
+        if item.is_group:
+            obj.group_id = item.room
+        obj.sender = MessageMember(user_id=item.sender, nickname=item.sender_name)
         obj.session_id = item.session_id
         obj.message_id = item.event_id
-        obj.message_str = ("[视频]" if item.media_kind == "video" else "[图片]") if item.media_path else item.content
-        quote = item.quote
-        if quote is not None:
-            obj.message_str = str(quote.get("reply_text") or "")[:4500] or "[引用回复]"
+        obj.message_str, components = inbound_content(item)
         obj.timestamp = item.created_at
         obj.raw_message = item.raw
         # Only native Hook explicit @ metadata counts. Never infer @ from plain text.
-        obj.message = [At(qq=item.owner)] if item.at_me is True else []
-        attachment = None
-        if item.media_path:
-            component = Video if item.media_kind == "video" else Image
-            attachment = component.fromFileSystem(item.media_path)
-        if quote is not None:
-            reply = make_reply(quote, attachment)
-            if reply is not None:
-                obj.message.append(reply)
-                attachment = None
-            else:
-                obj.message.append(Plain(text="[引用原文；缺少有效原消息 ID]\n" + quote_text(quote)))
-        obj.message.append(Plain(text=obj.message_str))
-        if attachment is not None:
-            obj.message.append(attachment)
+        obj.message = mention_components(item)
+        obj.message.extend(components)
         return obj
 
     def create_event(self, message: AstrBotMessage) -> AstrMessageEvent:
@@ -178,7 +163,8 @@ class WeChatHookPlatform(Platform):
             platform_meta=self.meta(), session_id=message.session_id, adapter=self,
         )
         attach_pipeline_ack(event.trace, self._inbox, message.message_id)
-        event.set_extra('wechat_workspace_id', self._inbox.workspace_id(message.self_id, message.group_id))
+        if message.type == MessageType.GROUP_MESSAGE:
+            event.set_extra('wechat_workspace_id', self._inbox.workspace_id(message.self_id, message.group_id))
         return event
 
     async def _request(self, method: str, route: str, *, data: dict | None = None) -> tuple[int, dict | list]:
@@ -282,6 +268,10 @@ class WeChatHookPlatform(Platform):
     async def send_by_session(self, session, message_chain: MessageChain,
                               origin_event: HookMessageEvent | None = None) -> None:
         owner, room = split_session(session.session_id)
+        is_group = room.endswith("@chatroom")
+        expected_type = MessageType.GROUP_MESSAGE if is_group else MessageType.FRIEND_MESSAGE
+        if session.message_type != expected_type:
+            raise ValueError("Outbound session type differs from its WeChat destination")
         if owner != self.owner:
             raise ValueError("Outbound destination is outside configured account")
         parts = message_chain.chain if message_chain else []
@@ -307,6 +297,8 @@ class WeChatHookPlatform(Platform):
                     mentions.append(recipient)
         if self.send_enabled and len(mentions) > 64:
             raise ValueError("At most 64 native @ targets are supported")
+        if self.send_enabled and mentions and not is_group:
+            raise ValueError("Private text replies do not support group @ targets")
         # An explicit HookMessageEvent.send() carries its own provenance.
         # For implicit context binding, require that AstrBot is *still executing*
         # the source event. Background asyncio tasks inherit ContextVars and may

@@ -1,11 +1,11 @@
 """Deterministic per-source draft identity, independent of AstrBot imports."""
 from __future__ import annotations
 import hashlib
-from .identity import group_session
+from .identity import conversation_session
 
 
 def draft_intent(owner: str, room: str, source_event_id: str, ordinal: int) -> str:
-    group_session(owner, room)
+    conversation_session(owner, room)
     if not source_event_id or len(source_event_id) > 220:
         raise ValueError("Missing or oversized source message ID")
     if type(ordinal) is not int or ordinal < 0 or ordinal > 10000:
@@ -15,7 +15,7 @@ def draft_intent(owner: str, room: str, source_event_id: str, ordinal: int) -> s
 
 
 def source_draft_identity(source, adapter, session_id: str, owner: str, room: str) -> tuple[str, str]:
-    """Bind a reply to the current, same-adapter/same-group message.
+    """Bind a reply to the current, same-adapter/same-conversation message.
 
     The caller must first verify source is its own HookMessageEvent instance;
     this function is a pure, easily testable guard for all remaining identities.
@@ -25,9 +25,12 @@ def source_draft_identity(source, adapter, session_id: str, owner: str, room: st
         return "", ""
     session = getattr(source, "session", None)
     message = getattr(source, "message_obj", None)
+    destination = getattr(message, "group_id", None) or getattr(getattr(message, "sender", None), "user_id", None)
     if (getattr(session, "session_id", None) != session_id
             or getattr(message, "self_id", None) != owner
-            or getattr(message, "group_id", None) != room):
+            or destination != room
+            or conversation_session(owner, room) != session_id
+            or getattr(message, "type", None) != getattr(session, "message_type", None)):
         return "", ""
     source_id = str(getattr(message, "message_id", "") or "")
     if not source_id or len(source_id) > 220:

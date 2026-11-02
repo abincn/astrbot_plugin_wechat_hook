@@ -26,6 +26,7 @@ from .drafts import source_draft_identity
 from .outbound import NativeTextSender
 from .components import inbound_content, mention_components
 from .contacts import ContactNames
+from .video_inputs import VideoInputs
 from astrbot.core.platform.astr_message_event import current_message_event
 
 
@@ -75,6 +76,8 @@ class HookMessageEvent(AstrMessageEvent):
         "poll_interval": 2.0,
         "send_enabled": False,
         "capture_enabled": False,
+        "video_frames_enabled": True,
+        "video_audio_enabled": True,
     },
     support_streaming_message=False,
     adapter_display_name="微信 Hook 连接",
@@ -87,6 +90,8 @@ class HookMessageEvent(AstrMessageEvent):
         "poll_interval": {"type": "float", "description": "轮询间隔（秒）"},
         "send_enabled": {"type": "bool", "description": "允许真实发送", "hint": "开启后，新回复会提交给微信 Hook；历史草稿不会发送。"},
         "capture_enabled": {"type": "bool", "description": "自动开启 Hook 消息采集", "hint": "默认关闭，避免改动现有采集配置。"},
+        "video_frames_enabled": {"type": "bool", "description": "视频画面分析", "hint": "使用自带 ffmpeg 最多抽取约 0、3、9 秒的三帧；需要视觉模型。"},
+        "video_audio_enabled": {"type": "bool", "description": "视频音轨识别", "hint": "提取前最多120秒音轨，调用当前会话已配置的 ASR，可能产生识别费用；未配置时明确提示。"},
     },
 )
 class WeChatHookPlatform(Platform):
@@ -96,8 +101,11 @@ class WeChatHookPlatform(Platform):
         self._enabled = config_switch(self.config.get("enable", False), "enable")
         self.send_enabled = config_switch(self.config.get("send_enabled", False), "send_enabled")
         self.capture_enabled = config_switch(self.config.get("capture_enabled", False), "capture_enabled")
+        self.video_frames_enabled = config_switch(self.config.get("video_frames_enabled", True), "video_frames_enabled")
+        self.video_audio_enabled = config_switch(self.config.get("video_audio_enabled", True), "video_audio_enabled")
         self.config.update(enable=self._enabled, send_enabled=self.send_enabled,
-                           capture_enabled=self.capture_enabled)
+                           capture_enabled=self.capture_enabled, video_frames_enabled=self.video_frames_enabled,
+                           video_audio_enabled=self.video_audio_enabled)
         self.url = str(self.config.get("hook_url") or "http://127.0.0.1:30001").rstrip("/")
         endpoint = urlsplit(self.url)
         if (endpoint.scheme != 'http' or endpoint.hostname not in {'127.0.0.1', 'localhost', '::1'}
@@ -114,6 +122,7 @@ class WeChatHookPlatform(Platform):
         self._task_runtime = None
         self._sender = NativeTextSender(self._inbox, self._request, self.owner)
         self._contacts = ContactNames(self._request)
+        self._video_inputs = None
         self._meta = PlatformMetadata(
             name="wechat_pc_hook", description="PC WeChat Hook with persistent inbound audit",
             id=str(self.config.get("id") or "wechat_pc_hook"),
@@ -122,6 +131,14 @@ class WeChatHookPlatform(Platform):
 
     def meta(self) -> PlatformMetadata:
         return self._meta
+
+    async def prepare_video_input(self, event, req, context) -> None:
+        if self._stopping.is_set() or not (self.video_frames_enabled or self.video_audio_enabled):
+            return
+        if self._video_inputs is None:
+            self._video_inputs = VideoInputs(self._media_root, context)
+        await self._video_inputs.apply(event, req, frames_enabled=self.video_frames_enabled,
+                                       audio_enabled=self.video_audio_enabled)
 
     def get_task_scope(self) -> dict:
         """Versioned, data-only binding for an optional task plugin."""

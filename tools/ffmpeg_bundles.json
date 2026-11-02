@@ -1,0 +1,20 @@
+{
+  "windows-x86_64": {
+    "url": "https://files.pythonhosted.org/packages/2c/c6/fa760e12a2483469e2bf5058c5faff664acf66cadb4df2ad6205b016a73d/imageio_ffmpeg-0.6.0-py3-none-win_amd64.whl",
+    "sha256": "02fa47c83703c37df6bfe4896aab339013f62bf02c5ebf2dce6da56af04ffc0a",
+    "member": "imageio_ffmpeg/binaries/ffmpeg-win-x86_64-v7.1.exe",
+    "target": "ffmpeg.exe"
+  },
+  "linux-x86_64": {
+    "url": "https://files.pythonhosted.org/packages/a0/2d/43c8522a2038e9d0e7dbdf3a61195ecc31ca576fb1527a528c877e87d973/imageio_ffmpeg-0.6.0-py3-none-manylinux2014_x86_64.whl",
+    "sha256": "c7e46fcec401dd990405049d2e2f475e2b397779df2519b544b8aab515195282",
+    "member": "imageio_ffmpeg/binaries/ffmpeg-linux-x86_64-v7.0.2",
+    "target": "ffmpeg"
+  },
+  "linux-aarch64": {
+    "url": "https://files.pythonhosted.org/packages/33/e7/1925bfbc563c39c1d2e82501d8372734a5c725e53ac3b31b4c2d081e895b/imageio_ffmpeg-0.6.0-py3-none-manylinux2014_aarch64.whl",
+    "sha256": "1d47bebd83d2c5fc770720d211855f208af8a596c82d17730aa51e815cdee6dc",
+    "member": "imageio_ffmpeg/binaries/ffmpeg-linux-aarch64-v7.0.2",
+    "target": "ffmpeg"
+  }
+}

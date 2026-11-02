@@ -9,6 +9,9 @@ permissions:
 jobs:
   package:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        platform: [windows-x86_64, linux-x86_64, linux-aarch64]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -17,9 +20,9 @@ jobs:
       - name: Check Python syntax
         run: python -m compileall -q .
       - name: Build install ZIP
-        run: python tools/package_plugin.py
+        run: python tools/package_plugin.py --bundle-platform ${{ matrix.platform }}
       - uses: actions/upload-artifact@v4
         with:
-          name: astrbot_plugin_wechat_hook
+          name: astrbot_plugin_wechat_hook-${{ matrix.platform }}
           path: dist/astrbot_plugin_wechat_hook.zip
           if-no-files-found: error

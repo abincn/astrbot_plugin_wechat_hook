@@ -23,9 +23,24 @@ from .inbox import DurableInbox
 from .media import process_pending_media
 from .delivery import attach_pipeline_ack
 from .drafts import source_draft_identity
+from .outbound import NativeTextSender
 from astrbot.core.platform.astr_message_event import current_message_event
 
 log = logging.getLogger(__name__)
+
+
+def config_switch(value, name: str) -> bool:
+    if type(value) is bool:
+        return value
+    if isinstance(value, str) and value.strip().lower() in {"true", "false"}:
+        return value.strip().lower() == "true"
+    raise ValueError(f"{name} must be a boolean switch")
+
+
+class HookResponseError(RuntimeError):
+    def __init__(self, status_code: int, route: str, detail: str):
+        self.status_code = status_code
+        super().__init__(f"Hook {route} HTTP {status_code}: {detail[:150]}")
 
 
 class HookMessageEvent(AstrMessageEvent):
@@ -60,11 +75,27 @@ class HookMessageEvent(AstrMessageEvent):
         "capture_enabled": False,
     },
     support_streaming_message=False,
+    adapter_display_name="微信 Hook 连接",
+    config_metadata={
+        "enable": {"type": "bool", "description": "启用连接"},
+        "hook_url": {"type": "string", "description": "Hook 地址"},
+        "hook_token": {"type": "string", "description": "Hook 访问令牌", "secret": True},
+        "self_wxid": {"type": "string", "description": "登录微信的 wxid"},
+        "inbox_db": {"type": "string", "description": "消息数据库路径"},
+        "poll_interval": {"type": "float", "description": "轮询间隔（秒）"},
+        "send_enabled": {"type": "bool", "description": "允许真实发送", "hint": "开启后，新回复会提交给微信 Hook；历史草稿不会发送。"},
+        "capture_enabled": {"type": "bool", "description": "自动开启 Hook 消息采集", "hint": "默认关闭，避免改动现有采集配置。"},
+    },
 )
 class WeChatHookPlatform(Platform):
     def __init__(self, platform_config: dict, platform_settings: dict, event_queue: asyncio.Queue):
         super().__init__(platform_config, event_queue)
         self.owner = str(self.config.get("self_wxid") or "").strip()
+        self._enabled = config_switch(self.config.get("enable", False), "enable")
+        self.send_enabled = config_switch(self.config.get("send_enabled", False), "send_enabled")
+        self.capture_enabled = config_switch(self.config.get("capture_enabled", False), "capture_enabled")
+        self.config.update(enable=self._enabled, send_enabled=self.send_enabled,
+                           capture_enabled=self.capture_enabled)
         self.url = str(self.config.get("hook_url") or "http://127.0.0.1:30001").rstrip("/")
         endpoint = urlsplit(self.url)
         if (endpoint.scheme != 'http' or endpoint.hostname not in {'127.0.0.1', 'localhost', '::1'}
@@ -79,6 +110,7 @@ class WeChatHookPlatform(Platform):
         self._media_root = Path(str(self.config.get('inbox_db') or 'data/wechat_hook_inbox.sqlite3')).resolve().parent / 'media'
         self._client: httpx.AsyncClient | None = None
         self._task_runtime = None
+        self._sender = NativeTextSender(self._inbox, self._request, self.owner)
         self._meta = PlatformMetadata(
             name="wechat_pc_hook", description="PC WeChat Hook with persistent inbound audit",
             id=str(self.config.get("id") or "wechat_pc_hook"),
@@ -94,7 +126,7 @@ class WeChatHookPlatform(Platform):
             raise ValueError("WeChat Hook adapter is stopped")
         return {"version": 2, "owner": self.owner,
                 "inbox_db": str(self._inbox.location),
-                "draft_only": not bool(self.config.get("send_enabled", False))}
+                "draft_only": not self.send_enabled}
 
     def attach_task_runtime(self, runtime) -> None:
         """The connector only owns stop supervision, never task construction."""
@@ -137,7 +169,7 @@ class WeChatHookPlatform(Platform):
         assert self._client is not None
         resp = await self._client.request(method, route, json=data)
         if resp.status_code >= 400:
-            raise RuntimeError(f"Hook {route} HTTP {resp.status_code}: {resp.text[:150]}")
+            raise HookResponseError(resp.status_code, route, resp.text)
         payload = resp.json()
         if not isinstance(payload, (dict, list)):
             raise RuntimeError("Unexpected Hook response")
@@ -165,6 +197,8 @@ class WeChatHookPlatform(Platform):
 
     async def run(self) -> None:
         try:
+            if not self._enabled:
+                return
             if not self.owner:
                 raise RuntimeError("Set self_wxid before enabling this adapter")
             headers = {"X-Wxcx-Token": self.token} if self.token else {}
@@ -172,7 +206,7 @@ class WeChatHookPlatform(Platform):
                 base_url=self.url, headers=headers, timeout=8, trust_env=False,
             ) as client:
                 self._client = client
-                if self.config.get("capture_enabled", False):
+                if self.capture_enabled:
                     # Explicit opt-in. Never rewrite the Hook callback URL.
                     await self._request(
                         "POST", "/wxcx/messages/config",
@@ -189,6 +223,10 @@ class WeChatHookPlatform(Platform):
                         )
                     except Exception as exc:
                         log.warning('Media processing failed: %s', type(exc).__name__)
+                    try:
+                        await self._sender.poll_once()
+                    except Exception as exc:
+                        log.warning("Text status processing failed (%s)", type(exc).__name__)
                     # Existing durable pending events are dispatched without sending.
                     for msg in self._inbox.pending():
                         try:
@@ -232,11 +270,27 @@ class WeChatHookPlatform(Platform):
             raise ValueError("Outbound destination is outside configured account")
         parts = message_chain.chain if message_chain else []
         text = "".join(p.text for p in parts if isinstance(p, Plain)).strip()
-        unsupported = [type(p).__name__ for p in parts if not isinstance(p, Plain)]
+        unsupported = [type(p).__name__ for p in parts if not isinstance(p, (Plain, At))]
+        if unsupported and self.send_enabled:
+            raise ValueError("Native sending supports text and group @ only; disable quote/media replies")
         if unsupported:
             text += "\n[Unsupported outgoing components: " + ", ".join(unsupported) + "]"
         if not text.strip():
             return
+        if self.send_enabled and (len(text) > 30000 or len(text.encode("utf-8")) > 32768):
+            raise ValueError("Hook text exceeds 30000 characters or 32768 UTF-8 bytes; split the reply")
+        mentions = []
+        for part in parts:
+            if isinstance(part, At):
+                recipient = str(part.qq)
+                if self.send_enabled and (not recipient or recipient.lower() in {"all", "0"}
+                        or recipient.endswith("@chatroom") or len(recipient.encode("utf-8")) > 256
+                        or any(ch.isspace() or ch in ",|:" for ch in recipient)):
+                    raise ValueError("Unsupported native group @ target")
+                if recipient not in mentions:
+                    mentions.append(recipient)
+        if self.send_enabled and len(mentions) > 64:
+            raise ValueError("At most 64 native @ targets are supported")
         # An explicit HookMessageEvent.send() carries its own provenance.
         # For implicit context binding, require that AstrBot is *still executing*
         # the source event. Background asyncio tasks inherit ContextVars and may
@@ -249,8 +303,16 @@ class WeChatHookPlatform(Platform):
         if context_is_live and isinstance(source, HookMessageEvent):
             source_event_id, intent_id = source_draft_identity(
                 source, self, session.session_id, owner, room)
-        # Never invoke the native Hook send endpoint in this pilot.
-        self._inbox.record_outbound(owner, room, text, "draft_only",
-                                    source_event_id=source_event_id, intent_id=intent_id)
-        log.info("Draft persisted for %s; native WeChat send disabled in prototype", room)
+        # Unlinked/proactive messages stay drafts; only a live inbound reply may send.
+        native_send = self.send_enabled and bool(source_event_id)
+        if native_send and (self._stopping.is_set() or self._client is None):
+            raise RuntimeError("WeChat transport is not running")
+        record_id = self._inbox.record_outbound(
+            owner, room, text, "send_prepared" if native_send else "draft_only",
+            source_event_id=source_event_id, intent_id=intent_id,
+        )
+        if native_send:
+            await self._sender.send_once(record_id, room, text, mentions)
+        else:
+            log.info("Draft persisted for %s; no native send was requested", room)
         await super().send_by_session(session, message_chain)

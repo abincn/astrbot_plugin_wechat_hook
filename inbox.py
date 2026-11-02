@@ -1,4 +1,4 @@
-"""SQLite-backed durable inbox, media state and draft-only outbound store."""
+"""SQLite-backed inbound, media and immutable outbound decision records."""
 from __future__ import annotations
 
 import json
@@ -294,7 +294,8 @@ class DurableInbox:
                         source_event_id: str = "", intent_id: str = "") -> int:
         """Persist the decision to reply, optionally idempotent across event replay.
 
-        This only creates a draft. It does not perform or schedule WeChat sends.
+        This only persists a record. Native submission is reserved separately;
+        a historical draft is never promoted automatically.
         A stable intent_id belongs to one logical reply, not merely a text hash.
         """
         group_session(owner, room)

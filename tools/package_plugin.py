@@ -18,6 +18,7 @@ FILES = [
     "identity.py",
     "inbox.py",
     "main.py",
+    "outbound.py",
     "media.py",
     "metadata.yaml",
     "README.md",

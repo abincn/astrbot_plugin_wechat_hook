@@ -25,6 +25,7 @@ FILES = [
     "inbox.py",
     "main.py",
     "outbound.py",
+    "notifications.py",
     "payloads.py",
     "quotes.py",
     "media.py",

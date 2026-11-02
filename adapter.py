@@ -27,6 +27,7 @@ from .outbound import NativeTextSender
 from .components import inbound_content, mention_components
 from .contacts import ContactNames
 from .video_inputs import VideoInputs
+from .notifications import service_notice_reason
 from astrbot.core.platform.astr_message_event import current_message_event
 
 
@@ -221,6 +222,10 @@ class WeChatHookPlatform(Platform):
         if not isinstance(events, list):
             raise RuntimeError("Hook event response has no events list")
         self._inbox.ingest_batch(events, self.owner)
+        for raw in events:
+            reason = service_notice_reason(raw)
+            if reason:
+                log.info(f"Hook service notification retained; auto-reply skipped: reason={reason}")
 
     async def run(self) -> None:
         try:
@@ -330,6 +335,9 @@ class WeChatHookPlatform(Platform):
         # the source event. Background asyncio tasks inherit ContextVars and may
         # retain a stale current_message_event after the pipeline has finished.
         source = origin_event if origin_event is not None else current_message_event.get()
+        if isinstance(source, HookMessageEvent) and service_notice_reason(getattr(source.message_obj, "raw_message", None)):
+            log.info("Hook service notification reply suppressed; no native send requested")
+            return
         context_is_live = (origin_event is not None
                            or getattr(source, "_execution_active", False) is True)
         source_event_id = ""

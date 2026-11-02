@@ -5,6 +5,7 @@ import time
 from dataclasses import dataclass
 
 from .identity import conversation_session, stable_hash
+from .notifications import service_notice_reason
 
 @dataclass(frozen=True)
 class Inbound:
@@ -33,6 +34,10 @@ class Inbound:
     @property
     def is_group(self) -> bool:
         return self.raw.get("is_group") is True
+
+    @property
+    def service_notice(self) -> str:
+        return service_notice_reason(self.raw)
 
     @property
     def quote(self) -> dict | None:

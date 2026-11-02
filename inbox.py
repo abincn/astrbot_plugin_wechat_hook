@@ -190,6 +190,9 @@ class DurableInbox:
                         raise ValueError("Hook event metadata exceeds 96KB (cursor not advanced)")
                     text_ready = not message.media_kind
                     state = "pending" if text_ready else "held_media"
+                    notice_reason = message.service_notice
+                    if notice_reason:
+                        state = "service_notice"
                     res = self.conn.execute("""
                         INSERT OR IGNORE INTO inbox
                         (event_id,sequence,owner,room,sender,content,kind,at_me,
@@ -202,7 +205,10 @@ class DurableInbox:
                           message.media_kind, ""))
                     if res.rowcount > 0:
                         inserted += 1
-                        if (message.media_kind == "emoji" or
+                        if notice_reason:
+                            self.conn.execute("UPDATE inbox SET last_error=? WHERE event_id=?",
+                                              ("service_notice:" + notice_reason, message.event_id))
+                        elif (message.media_kind == "emoji" or
                                 message.media_kind in {"image", "video", "file", "voice"}
                                 and message.media_msgsvrid.isdecimal()):
                             request_id = "astrbot-media-" + stable_hash([message.event_id])[:32]
@@ -228,7 +234,20 @@ class DurableInbox:
                 FROM inbox i
                 WHERE i.status='pending' ORDER BY i.sequence, i.inserted_at LIMIT ?
             """, (limit,)).fetchall()
-        return [self._row_to_inbound(r) for r in rows]
+        result = []
+        for row in rows:
+            message = self._row_to_inbound(row)
+            if message.service_notice:
+                self.mark_service_notice(message.event_id, message.service_notice)
+            else:
+                result.append(message)
+        return result
+
+    def mark_service_notice(self, event_id: str, reason: str) -> None:
+        with self._lock:
+            self.conn.execute("UPDATE inbox SET status='service_notice',last_error=? "
+                              "WHERE event_id=? AND status IN ('pending','held_media')",
+                              ("service_notice:" + reason, event_id))
 
     @staticmethod
     def _row_to_inbound(r: sqlite3.Row) -> Inbound:
@@ -248,7 +267,7 @@ class DurableInbox:
                 SELECT i.event_id,i.owner,i.room,i.sender,i.kind,i.media_kind,i.raw_json,
                        j.request_id,j.task_id,j.status,j.error
                 FROM inbox i JOIN media_jobs j ON j.event_id=i.event_id
-                WHERE j.status IN ('new','pending')
+                WHERE j.status IN ('new','pending') AND i.status='held_media'
                 ORDER BY i.sequence LIMIT ?
             """, (limit,)).fetchall()
             return [dict(r) for r in rows]

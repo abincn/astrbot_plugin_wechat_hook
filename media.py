@@ -96,6 +96,9 @@ async def process_pending_media(inbox, request, client, media_root: str | Path) 
         if source is None or source.media_kind not in {*LIMITS, "voice", "emoji"}:
             inbox.media_failed(event_id, "Unsupported media source")
             continue
+        if source.service_notice:
+            inbox.mark_service_notice(event_id, source.service_notice)
+            continue
         kind = source.media_kind
         if kind in {"voice", "emoji"}:
             if item["status"] != "new" or not inbox.begin_media(event_id):

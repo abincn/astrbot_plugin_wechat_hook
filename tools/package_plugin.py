@@ -21,8 +21,7 @@ FILES = [
     "media.py",
     "metadata.yaml",
     "README.md",
-    "requirements.txt",
-    "workspace.py"
+    "requirements.txt"
 ]
 
 

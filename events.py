@@ -30,7 +30,7 @@ class Inbound:
         return group_session(self.owner, self.room)
 
 
-def normalize_event(event: dict, self_wxid: str, allowed_rooms: set[str]) -> Inbound | None:
+def normalize_event(event: dict, self_wxid: str) -> Inbound | None:
     """Accept only explicitly incoming group events; never infer a native @ from text."""
     if not isinstance(event, dict):
         raise ValueError("Hook event must be a JSON object")
@@ -39,7 +39,7 @@ def normalize_event(event: dict, self_wxid: str, allowed_rooms: set[str]) -> Inb
     if event.get("direction") != "incoming" or event.get("is_group") is not True:
         return None
     room = str(event.get("room_id") or event.get("conversation_id") or "")
-    if not room.endswith("@chatroom") or room not in allowed_rooms:
+    if not room.endswith("@chatroom"):
         return None
     owner = str(event.get("self_id") or self_wxid or "")
     if not owner or (self_wxid and owner != self_wxid):

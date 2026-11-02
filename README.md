@@ -1,6 +1,7 @@
 # 微信 Hook 连接插件
 
-独立的 AstrBot 插件：连接现有 PC WeChat Hook，接收群消息，持久化 Inbox，隔离群会话，并把 AstrBot 回复保存为草稿。
+独立的 AstrBot 连接插件：连接现有 PC WeChat Hook，转换群消息、持久化 Inbox，并把 AstrBot 回复保存为草稿。
+群 Agent 名单、按群指令和模型工具策略由 Agent 插件管理。
 
 **当前为草稿模式原型，不会真实发送微信。** 即使把 `send_enabled` 改为 `true`，也不会调用微信发送接口。
 任务编排和任务工作台由另一个仓库提供：[微信 Agent 任务插件](https://github.com/abincn/astrbot_plugin_wechat_agents)。
@@ -33,7 +34,6 @@ https://github.com/abincn/astrbot_plugin_wechat_hook
   "hook_url": "http://127.0.0.1:30001",
   "hook_token": "YOUR_HOOK_TOKEN",
   "self_wxid": "YOUR_WXID",
-  "allowed_rooms": ["YOUR_ROOM@chatroom"],
   "inbox_db": "data/wechat_hook_inbox.sqlite3",
   "poll_interval": 2,
   "send_enabled": false,
@@ -44,7 +44,7 @@ https://github.com/abincn/astrbot_plugin_wechat_hook
 用实际值替换占位内容后再启用：
 
 - `self_wxid` 是微信内部账号 ID，不是昵称或手机号。
-- `allowed_rooms` 必须是数组；每项是完整群 ID，结尾为 `@chatroom`，不是群名。
+- 不再配置 `allowed_rooms`。旧配置残留的该字段会被忽略；本连接器接收当前账号所有支持的入站群消息，暂不支持私聊。
 - `hook_token` 必须与 Hook 服务的访问令牌一致；HTTP 401 表示鉴权被拒绝。
 - `hook_url` 目前仅接受本机回环 HTTP 地址，Hook 应与 AstrBot 运行在同一台电脑。
 - 默认不更改 Hook 的采集配置或回调地址。先用现有 Hook 控制方式确认采集已启用。
@@ -56,11 +56,22 @@ https://github.com/abincn/astrbot_plugin_wechat_hook
 ## 与 Agent 插件配合
 
 连接插件不导入 Agent、不注册任务页面、不创建任务或启动 Worker。
-它保留按群文档和默认空工具策略，以及一个供可选 Agent 插件使用的版本化绑定接口：
+它仅提供连接、格式转换和消息来源标识，以及供可选 Agent 插件使用的版本化绑定接口：
 `get_task_scope()`、`attach_task_runtime()`、`detach_task_runtime()`。
 停止平台会停止已绑定的 Worker。平台重载后需完整重启独立实例来重绑。
 
 原平台 ID、Inbox 路径和消息状态继续使用，不做数据库迁移。Agent 的授权配置另见其仓库说明。
+
+Hook 本身不限制哪些群使用模型，不控制唤醒词、人设或工具。只安装连接器时，回复条件和工具行为遵循 AstrBot 原生配置，
+并不表示每条消息都会被回复。安装 Agent 后，在 **插件 → 微信 Agent 任务 → 配置** 选择启用群；
+只有这些群会应用 Agent 的按群指令、空工具策略和任务授权，名单外仍遵循 AstrBot 原生规则。
+
+### 升级到 v0.3.0
+
+同时更新连接和 Agent 插件，在 Agent 的配置页面填写原来的群 ID 列表，再完整重启独立实例。
+不要依赖旧 Hook `allowed_rooms` 或任务文件中的 `rooms` 继续限制接收。
+连接器现在会持久化更多群的入站消息；如需限制普通 AstrBot 回复，使用 AstrBot 自身的访问控制/回复配置。
+会话标识和已有 Inbox 游标不变，不自动回放过去未接收的消息，也不启用真实发送。
 
 ## 打包下载
 
@@ -77,6 +88,6 @@ python tools/package_plugin.py
 
 ## 当前验证范围
 
-迁移自已拆分的插件版本 v0.2.0，保留原业务行为。迁移只进行语法检查、静态核对和 ZIP 构建，
+v0.3.0 将群策略移到 Agent 插件。仅进行语法检查、静态核对和 ZIP 构建，
 没有编写测试代码或运行本地测试，也没有部署到生产或连接真实微信/模型。
 真实发送、处理回执、多进程恢复与实机升级验收仍未实现或未验证。

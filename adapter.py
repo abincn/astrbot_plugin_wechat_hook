@@ -54,7 +54,6 @@ class HookMessageEvent(AstrMessageEvent):
         "hook_url": "http://127.0.0.1:30001",
         "hook_token": "",
         "self_wxid": "",
-        "allowed_rooms": [],
         "inbox_db": "data/wechat_hook_inbox.sqlite3",
         "poll_interval": 2.0,
         "send_enabled": False,
@@ -66,7 +65,6 @@ class WeChatHookPlatform(Platform):
     def __init__(self, platform_config: dict, platform_settings: dict, event_queue: asyncio.Queue):
         super().__init__(platform_config, event_queue)
         self.owner = str(self.config.get("self_wxid") or "").strip()
-        self.rooms = set(self.config.get("allowed_rooms") or [])
         self.url = str(self.config.get("hook_url") or "http://127.0.0.1:30001").rstrip("/")
         endpoint = urlsplit(self.url)
         if (endpoint.scheme != 'http' or endpoint.hostname not in {'127.0.0.1', 'localhost', '::1'}
@@ -94,7 +92,7 @@ class WeChatHookPlatform(Platform):
         """Versioned, data-only binding for an optional task plugin."""
         if self._stopping.is_set():
             raise ValueError("WeChat Hook adapter is stopped")
-        return {"version": 1, "owner": self.owner, "rooms": tuple(self.rooms),
+        return {"version": 2, "owner": self.owner,
                 "inbox_db": str(self._inbox.location),
                 "draft_only": not bool(self.config.get("send_enabled", False))}
 
@@ -163,14 +161,12 @@ class WeChatHookPlatform(Platform):
         events = payload if isinstance(payload, list) else payload.get("events", [])
         if not isinstance(events, list):
             raise RuntimeError("Hook event response has no events list")
-        self._inbox.ingest_batch(events, self.owner, self.rooms)
+        self._inbox.ingest_batch(events, self.owner)
 
     async def run(self) -> None:
         try:
-            if not self.owner or not self.rooms:
-                raise RuntimeError("Set self_wxid and allowed_rooms before enabling this adapter")
-            if not all(str(room).endswith("@chatroom") for room in self.rooms):
-                raise RuntimeError("allowed_rooms must contain @chatroom group IDs")
+            if not self.owner:
+                raise RuntimeError("Set self_wxid before enabling this adapter")
             headers = {"X-Wxcx-Token": self.token} if self.token else {}
             async with httpx.AsyncClient(
                 base_url=self.url, headers=headers, timeout=8, trust_env=False,
@@ -232,8 +228,8 @@ class WeChatHookPlatform(Platform):
     async def send_by_session(self, session, message_chain: MessageChain,
                               origin_event: HookMessageEvent | None = None) -> None:
         owner, room = split_session(session.session_id)
-        if owner != self.owner or room not in self.rooms:
-            raise ValueError("Outbound destination is outside configured account/group")
+        if owner != self.owner:
+            raise ValueError("Outbound destination is outside configured account")
         parts = message_chain.chain if message_chain else []
         text = "".join(p.text for p in parts if isinstance(p, Plain)).strip()
         unsupported = [type(p).__name__ for p in parts if not isinstance(p, Plain)]

@@ -169,7 +169,7 @@ class DurableInbox:
             self.conn.execute("INSERT INTO cursor(name,value) VALUES('hook_after',0) "
                               "ON CONFLICT(name) DO UPDATE SET value=0")
 
-    def ingest_batch(self, events: list[dict], owner: str, rooms: set[str]) -> tuple[int, int]:
+    def ingest_batch(self, events: list[dict], owner: str) -> tuple[int, int]:
         """Insert all accepted events and advance the Hook cursor atomically."""
         inserted = 0
         with self._transaction():
@@ -183,7 +183,7 @@ class DurableInbox:
                 seq = int(seq)
                 if seq <= 0:
                     raise ValueError("Hook event sequence missing")
-                message = normalize_event(item, owner, rooms)
+                message = normalize_event(item, owner)
                 if message is not None:
                     raw = json.dumps(item, ensure_ascii=False, separators=(",", ":"))
                     if len(raw.encode("utf-8")) > 96000:
@@ -224,7 +224,7 @@ class DurableInbox:
     @staticmethod
     def _row_to_inbound(r: sqlite3.Row) -> Inbound:
         raw = json.loads(r["raw_json"])
-        msg = normalize_event(raw, r["owner"], {r["room"]})
+        msg = normalize_event(raw, r["owner"])
         # Persisted rows are already validated; normalize once more to recover source metadata.
         return Inbound(r["event_id"], r["sequence"], r["owner"], r["room"], r["sender"],
                        msg.sender_name if msg else r["sender"], r["content"], r["kind"],

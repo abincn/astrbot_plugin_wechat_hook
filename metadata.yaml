@@ -1,6 +1,6 @@
 name: astrbot_plugin_wechat_hook
 display_name: 微信 Hook 连接
-desc: Standalone WeChat Hook connection, durable Inbox, group isolation and draft-only replies. Agent tasks are provided by the separate WeChat Agent plugin.
-version: 0.2.0
+desc: WeChat Hook transport, message conversion, durable Inbox and draft-only output. Group allowlists and Agent policy are configured in the separate Agent plugin.
+version: 0.3.0
 author: abincn
 repo: https://github.com/abincn/astrbot_plugin_wechat_hook

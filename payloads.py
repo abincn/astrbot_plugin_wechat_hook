@@ -141,6 +141,19 @@ def file_name(raw: dict) -> str:
     return name or "attachment"
 
 
+def quoted_file_card(quote: dict) -> dict:
+    """Recognize file subtype 6 only; never treat every appmsg/49 as a file."""
+    if str(quote.get("message_type")) != "49":
+        return {}
+    content = quote.get("content")
+    root = xml_body(content) if isinstance(content, str) else None
+    app = root if root is not None and root.tag == "appmsg" else root.find("appmsg") if root is not None else None
+    if app is None or (app.findtext("type") or "").strip() != "6":
+        media = quote.get("media")
+        return {"title": "attachment"} if isinstance(media, dict) and media.get("kind") == "file" else {}
+    return {"title": file_name({"card": {"title": app.findtext("title") or "attachment"}})}
+
+
 def location_metadata(content: str) -> dict | None:
     root = xml_body(content)
     node = root if root is not None and root.tag == "location" else root.find("location") if root is not None else None

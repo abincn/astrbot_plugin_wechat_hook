@@ -272,6 +272,31 @@ class DurableInbox:
             """, (limit,)).fetchall()
             return [dict(r) for r in rows]
 
+    def ready_file(self, owner: str, room: str, *, event_id: str = "", source_id: str = "") -> dict | None:
+        """Exact account/conversation/ID association; never match by file name."""
+        if not owner or not room or (not event_id and not source_id):
+            return None
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT i.event_id,i.raw_json,i.media_path,j.artifact_json FROM inbox i "
+                "JOIN media_jobs j ON j.event_id=i.event_id "
+                "WHERE i.owner=? AND i.room=? AND i.media_kind='file' AND j.status='ready' "
+                "AND (?='' OR i.event_id=?) ORDER BY i.sequence DESC LIMIT 128",
+                (owner, room, event_id, event_id),
+            ).fetchall()
+        for row in rows:
+            try:
+                raw = json.loads(row["raw_json"])
+                source = normalize_event(raw, owner)
+                artifact = json.loads(row["artifact_json"])
+                if (source is None or source.media_kind != "file" or source.media_source_talker != room
+                        or source_id and source.media_msgsvrid != source_id):
+                    continue
+                return {"path": row["media_path"], "artifact": artifact, "source": source}
+            except (ValueError, TypeError):
+                continue
+        return None
+
     def begin_media(self, event_id: str) -> bool:
         with self._lock:
             cur = self.conn.execute("UPDATE media_jobs SET status='requesting',updated_at=? "

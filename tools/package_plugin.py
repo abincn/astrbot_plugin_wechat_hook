@@ -20,6 +20,7 @@ FILES = [
     "delivery.py",
     "drafts.py",
     "events.py",
+    "file_artifacts.py",
     "extra_media.py",
     "ffmpeg_runtime.py",
     "identity.py",

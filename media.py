@@ -1,5 +1,6 @@
 """Verify media downloaded from Hook before exposing it to AstrBot."""
 import hashlib
+import asyncio
 import json
 from pathlib import Path
 import re
@@ -8,6 +9,7 @@ import httpx
 from astrbot.api import logger as log
 from .events import normalize_event
 from .extra_media import download_voice, download_emoji
+from .file_artifacts import read_verified_file
 
 
 MAX_IMAGE_BYTES = 12 * 1024 * 1024
@@ -43,9 +45,8 @@ def save_verified_media(folder: str | Path, data: bytes, artifact: dict, kind: s
     if size != len(data) or len(digest) != 64 or hashlib.sha256(data).hexdigest() != digest:
         raise ValueError("Media SHA256/size mismatch")
     if kind == "file":
-        suffix = str(artifact.get("extension") or "").lower().lstrip(".")
-        allowed = {"txt", "md", "csv", "json", "log", "xml", "pdf", "docx", "xlsx", "pptx", "doc", "xls", "ppt"}
-        ext = "." + suffix if suffix in allowed else ".bin"
+        # All file types use opaque storage; original names live in File.name.
+        ext = ".bin"
     elif kind == "video" and len(data) > 12 and data[4:8] == b"ftyp":
         ext = ".mp4"
     elif kind == "video" and data.startswith(bytes.fromhex("1a45dfa3")):
@@ -116,6 +117,17 @@ async def process_pending_media(inbox, request, client, media_root: str | Path) 
                 log.warning(f"Hook {kind} unavailable for event {event_id}: {reason}")
             continue
         if item["status"] == "new":
+            if kind == "file" and source.quote is not None:
+                cached = inbox.ready_file(item["owner"], source.media_source_talker,
+                                          source_id=source.media_msgsvrid)
+                if cached is not None:
+                    try:
+                        await asyncio.to_thread(read_verified_file, Path(media_root), cached)
+                        inbox.media_ready(event_id, cached["path"], cached["artifact"])
+                        log.info(f"Hook quoted file reused verified attachment: event={event_id}")
+                    except (OSError, ValueError, TypeError, KeyError):
+                        inbox.media_failed(event_id, "cached_file_integrity_failed")
+                    continue
             if not inbox.begin_media(event_id):
                 continue
             try:

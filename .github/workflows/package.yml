@@ -19,6 +19,8 @@ jobs:
           python-version: '3.11'
       - name: Check Python syntax
         run: python -m compileall -q .
+      - name: Check opaque file transport
+        run: python -B tests/test_file_transport.py
       - name: Build install ZIP
         run: python tools/package_plugin.py --bundle-platform ${{ matrix.platform }}
       - uses: actions/upload-artifact@v4

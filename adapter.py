@@ -28,6 +28,7 @@ from .outbound import NativeTextSender
 from .components import inbound_content, mention_components
 from .contacts import ContactNames
 from .video_inputs import VideoInputs
+from .file_artifacts import attach_file_metadata
 from .notifications import service_notice_reason
 from astrbot.core.platform.astr_message_event import current_message_event
 
@@ -204,6 +205,7 @@ class WeChatHookPlatform(Platform):
             platform_meta=self.meta(), session_id=message.session_id, adapter=self,
         )
         attach_pipeline_ack(event.trace, self._inbox, message.message_id)
+        attach_file_metadata(event, self._inbox, self.owner)
         if message.type == MessageType.GROUP_MESSAGE:
             event.set_extra('wechat_workspace_id', self._inbox.workspace_id(message.self_id, message.group_id))
         return event

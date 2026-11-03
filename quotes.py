@@ -1,8 +1,12 @@
 """Translate structured Hook quote metadata; no XML parsing or history fetch."""
 from astrbot.api.message_components import Plain, Reply
+from .payloads import quoted_file_card
 
 
 def quote_text(quote: dict) -> str:
+    card = quoted_file_card(quote)
+    if card:
+        return "[引用文件] " + card["title"]
     if str(quote.get("message_type")) == "1":
         return str(quote.get("content") or "")[:4500]
     return {"3": "[引用图片]", "43": "[引用视频]", "34": "[引用语音]"}.get(

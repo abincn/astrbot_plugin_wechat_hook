@@ -1,11 +1,11 @@
 # AstrBot、WeChat Hook 与连接插件的接收能力对照
 
-当前实现：连接插件 **v0.6.3**。对照本地 Hook 源码/API 清单和 AstrBot `v4.29.4` 消息组件。
+当前实现：连接插件 **v0.6.5**。对照本地 Hook 源码/API 清单和 AstrBot `v4.29.4` 消息组件。
 这是代码实现状态，尚未实机验收。接收到组件不等于所有模型都会理解它；资源能否取得仍取决于实际 Hook 与微信状态。
 
 ## 入站消息
 
-| 消息 | AstrBot 表达 | Hook 能提供 | 连接插件 v0.6.3 |
+| 消息 | AstrBot 表达 | Hook 能提供 | 连接插件 v0.6.5 |
 | --- | --- | --- | --- |
 | 文字（1） | `Plain` | 正文、来源、时间、ID | 已接入 |
 | @ | `At` / `AtAll` | 显式 mentions、is_at_me | 已映射普通目标及 `notify@all`；不从正文猜测 |
@@ -16,6 +16,7 @@
 | 文件传输通知（49/74） | `Plain` + `Json` | 阶段、状态、替代消息 ID | 已传递通知；实际文件仍使用后续内容消息 |
 | 引用文字（49/57） | `Reply` + `Plain` | 原消息 ID、发送者、时间、原文及回复正文 | 已接入；ID 保持字符串，缺少有效 ID 时明确文字回退 |
 | 引用图片/视频（49/57） | `Reply.chain` 中的 `Image` / `Video` | 引用源 ID、发送者、媒体元数据 | 按引用源下载；不拿外层 ID 当媒体源，缺少原始资源不能伪造附件 |
+| 引用文件（49/57 引用49/6） | `Reply.chain` 中的 `File`，原始附件交给后续处理层 | 引用原消息ID、原文件卡片XML和file媒体任务 | 同账号、同会话、同原消息ID复用校验附件；无缓存时按原ID取回，不按名称匹配 |
 | 链接（49/5） | `Share` + 文字 | 标题、描述、URL | 已接入卡片和可读摘要；不自动抓取网页正文 |
 | 小程序（49/33、36） | `Json` + 文字 | 标题、描述、app_id、username、page_path、URL | 已接入内嵌信息，不运行小程序 |
 | 表情（47） | 成功下载后 `Image`；失败时文字提示 | 原始 XML 中的 CDN 资源线索、MD5 | 对 `qpic.cn` 的 HTTPS 资源校验 MD5/大小/图片格式后接入；没有 URL/MD5、其他域名或加密资源仅保留提示与 raw_message |
@@ -43,7 +44,8 @@
 
 - 合并转发只展开消息中已经携带的内容；没有远程原文或节点媒体下载能力时，不能还原完整附件或无限层转发链。
 - 表情暂不接加密 CDN 解密或未知资源域名；只有元数据时不能假称已取得图片。
-- 文件 `resource_missing` 仍需在 Hook 侧排查；原文件打开失败（包括路径、权限或占用）也会返回该码，本轮未修复或替换 DLL。
+- 所有文件类型统一作为原始附件交付，原名与字节完整保留；不识别文件内容、不提取文本、不注入模型请求。下游可从 File/Reply.chain 与 wechat_attachments 取得附件及元数据，再自行决定文件识别与解析。24MiB资源上限和完整性校验仍保留。
+- Hook AI-HOOK-20261102-02 已有一条群文件缺失后原生下载及614字节产物取回证据，不扩大为所有文件或模型已阅读。插件这次修改不替换微信DLL；取回错误仍按实际任务结果处理。
 - 位置/名片和其他特殊消息只转换收到的数据，不执行导航、加好友、进群、支付、通话等操作。
 - 部分系统事件缺少可信方向/账号/会话时仍不分发，不能凭文本虚构来源；原始事件保留程度取决于 Hook。
 - 原生发送仍仅文本与普通群 @，私聊也可回复文本；`/SendQuoteMsg` 在当前 Hook 返回 `501 structured_send_unsupported`，媒体/卡片发送尚不可用。
@@ -70,4 +72,4 @@ XML 每次最多 96 KB、1200 个元素、24 层，拒绝 DTD/实体声明。转
 
 - AstrBot [消息组件](https://github.com/AstrBotDevs/AstrBot/blob/v4.29.4/astrbot/core/message/components.py)、[媒体转换](https://github.com/AstrBotDevs/AstrBot/blob/v4.29.4/astrbot/core/utils/media_utils.py)。
 - Hook：本地 `wxcx_message_model.cpp`、`wxcx_media_tasks.cpp`、`wxcx_media_native.cpp`、`wxcx_voice.cpp` 与 API 清单；没有请求现场能力接口。
-- 仅静态核对、Python 语法编译与安装 ZIP 构建、现有 CI；未编写/修改测试代码，未运行测试、ffmpeg、真实 Hook 或模型请求，未部署生产。
+- 本轮通用文件交付通过16项离线用例和ZIP校验；框架/HTTP用替身，SQLite和文件校验使用生产实现。未运行ffmpeg、真实模型或部署运行中的插件。

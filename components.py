@@ -5,6 +5,7 @@ from astrbot.api.message_components import At, AtAll, File, Image, Json, Locatio
 
 from .payloads import card_metadata, contact_metadata, file_name, forward_nodes, location_metadata, special_metadata, text
 from .quotes import make_reply, quote_text
+from .payloads import quoted_file_card
 
 
 def mention_components(item) -> list:
@@ -33,7 +34,8 @@ def inbound_content(item) -> tuple[str, list]:
     attachment = None
     if item.media_path:
         if item.media_kind == "file":
-            attachment = File(name=file_name(item.raw), file=item.media_path)
+            quoted = quoted_file_card(item.quote) if item.quote else {}
+            attachment = File(name=quoted.get("title") or file_name(item.raw), file=item.media_path)
         else:
             component = {"image": Image, "emoji": Image, "video": Video, "voice": Record}[item.media_kind]
             attachment = component.fromFileSystem(item.media_path)

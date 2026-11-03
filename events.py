@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 from .identity import conversation_session, stable_hash
 from .notifications import service_notice_reason
+from .payloads import quoted_file_card
 
 @dataclass(frozen=True)
 class Inbound:
@@ -103,11 +104,16 @@ def normalize_event(event: dict, self_wxid: str) -> Inbound | None:
         media_kind = "file"
     elif kind == 49 and message_kind == "quote":
         qmedia = quote.get("media") if isinstance(quote.get("media"), dict) else {}
-        if qmedia.get("kind") in ("image", "video") and str(quote.get("msgsvrid") or "").isdecimal():
-            media_kind = str(qmedia["kind"])
+        quoted_kind = "file" if quoted_file_card(quote) else qmedia.get("kind")
+        reference = str(quote.get("msgsvrid") or "")
+        valid_reference = reference.isascii() and reference.isdecimal() and len(reference) <= 20 and 0 < int(reference) <= 2**64 - 1
+        if quoted_kind in ("image", "video", "file") and valid_reference:
+            media_kind = str(quoted_kind)
             media_msgsvrid = str(quote["msgsvrid"])
             quoted_conversation = str(quote.get("conversation_id") or "")
-            if quoted_conversation and quoted_conversation != owner and quoted_conversation.endswith("@chatroom") == is_group:
+            if (quoted_conversation and quoted_conversation != owner
+                    and (quoted_kind != "file" or quoted_conversation == room)
+                    and quoted_conversation.endswith("@chatroom") == is_group):
                 try:
                     conversation_session(owner, quoted_conversation)
                     media_source_talker = quoted_conversation

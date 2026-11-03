@@ -21,6 +21,7 @@ FILES = [
     "drafts.py",
     "events.py",
     "file_artifacts.py",
+    "responses_files.py",
     "extra_media.py",
     "ffmpeg_runtime.py",
     "identity.py",

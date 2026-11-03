@@ -1,11 +1,11 @@
 # AstrBot、WeChat Hook 与连接插件的接收能力对照
 
-当前实现：连接插件 **v0.6.5**。对照本地 Hook 源码/API 清单和 AstrBot `v4.29.4` 消息组件。
+当前实现：连接插件 **v0.6.6**。对照本地 Hook 源码/API 清单和 AstrBot `v4.29.4` 消息组件。
 这是代码实现状态，尚未实机验收。接收到组件不等于所有模型都会理解它；资源能否取得仍取决于实际 Hook 与微信状态。
 
 ## 入站消息
 
-| 消息 | AstrBot 表达 | Hook 能提供 | 连接插件 v0.6.5 |
+| 消息 | AstrBot 表达 | Hook 能提供 | 连接插件 v0.6.6 |
 | --- | --- | --- | --- |
 | 文字（1） | `Plain` | 正文、来源、时间、ID | 已接入 |
 | @ | `At` / `AtAll` | 显式 mentions、is_at_me | 已映射普通目标及 `notify@all`；不从正文猜测 |
@@ -73,3 +73,9 @@ XML 每次最多 96 KB、1200 个元素、24 层，拒绝 DTD/实体声明。转
 - AstrBot [消息组件](https://github.com/AstrBotDevs/AstrBot/blob/v4.29.4/astrbot/core/message/components.py)、[媒体转换](https://github.com/AstrBotDevs/AstrBot/blob/v4.29.4/astrbot/core/utils/media_utils.py)。
 - Hook：本地 `wxcx_message_model.cpp`、`wxcx_media_tasks.cpp`、`wxcx_media_native.cpp`、`wxcx_voice.cpp` 与 API 清单；没有请求现场能力接口。
 - 本轮通用文件交付通过16项离线用例和ZIP校验；框架/HTTP用替身，SQLite和文件校验使用生产实现。未运行ffmpeg、真实模型或部署运行中的插件。
+
+## Responses文件直传（v0.6.6）
+
+在on_llm_request中传递当前附件的原名及原始字节，使用原生input_file，文件内容不展开为普通文本。对AstrBot4.29.4缺失的文件转换做实例级兼容；原有文本、图像、工具和推理链保持原转换。仅openai_responses实例启用，其他类型明确失败。当前会话引用已校验缓存可直接复用。
+
+`wechat_file_upload`的prepared和日志只代表请求已准备，accepted_by_api保持false；真正成功须由API响应及模型读到内容验证。管理员合成附件探针不使用用户文件、不增加新提供商、不读取或打印令牌。尚未获得生产中转验收时不可宣称已成功。

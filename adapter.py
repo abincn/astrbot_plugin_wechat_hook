@@ -29,6 +29,7 @@ from .components import inbound_content, mention_components
 from .contacts import ContactNames
 from .video_inputs import VideoInputs
 from .file_artifacts import attach_file_metadata
+from .responses_files import prepare_file_upload
 from .notifications import service_notice_reason
 from astrbot.core.platform.astr_message_event import current_message_event
 
@@ -162,6 +163,11 @@ class WeChatHookPlatform(Platform):
             self._video_inputs = VideoInputs(self._media_root, context)
         await self._video_inputs.apply(event, req, frames_enabled=self.video_frames_enabled,
                                        audio_enabled=self.video_audio_enabled)
+
+    async def prepare_file_upload(self, event, req, context) -> None:
+        if self._stopping.is_set(): return
+        if await prepare_file_upload(event, req, self._inbox, self.owner, self._media_root, context):
+            log.info(f"Hook attachment prepared as Responses input_file: event={event.message_obj.message_id}; API acceptance pending")
 
     def get_task_scope(self) -> dict:
         """Versioned, data-only binding for an optional task plugin."""

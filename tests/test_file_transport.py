@@ -27,7 +27,9 @@ for name in ('Plain', 'Reply', 'At', 'AtAll', 'File', 'Image', 'Json', 'Location
     setattr(components, name, type(name, (Component,), {}))
 sys.modules[components.__name__] = components
 event_api = types.ModuleType('astrbot.api.event')
-event_api.filter = types.SimpleNamespace(on_llm_request=lambda: lambda f: f)
+event_api.filter = types.SimpleNamespace(on_llm_request=lambda: lambda f: f,
+    command=lambda *a, **k: lambda f: f, permission_type=lambda *a, **k: lambda f: f,
+    PermissionType=types.SimpleNamespace(ADMIN='admin'))
 sys.modules[event_api.__name__] = event_api
 star = types.ModuleType('astrbot.api.star'); star.Context = object; star.Star = object
 sys.modules[star.__name__] = star
@@ -139,15 +141,16 @@ class FileTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(descriptor['sha256'], hashlib.sha256(self.body).hexdigest())
         self.assertNotIn('content', descriptor); self.assertNotIn('mime_type', descriptor)
 
-    async def test_model_hook_does_not_read_file_or_rewrite_prompt(self):
+    async def test_model_hook_does_not_inject_file_text_into_prompt(self):
         calls = []
         class Adapter:
+            async def prepare_file_upload(self, event, req, context): calls.append('file')
             async def prepare_video_input(self, event, req, context): calls.append('video')
         handler = main.Main.__new__(main.Main); handler._platform_type = Adapter; handler.context = None
         message = raw(); self.ready(message)
         event = Event(message); event.adapter = Adapter(); req = types.SimpleNamespace(prompt='原始问题')
         await handler.on_llm_request(event, req)
-        self.assertEqual(req.prompt, '原始问题'); self.assertEqual(calls, ['video'])
+        self.assertEqual(req.prompt, '原始问题'); self.assertEqual(calls, ['file', 'video'])
 
     def test_cache_isolated_by_account_room_and_message_ID(self):
         self.ready()

@@ -7,7 +7,7 @@ import json
 import types
 import sys
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, AsyncMock
 
 import test_file_transport as fixtures
 
@@ -211,5 +211,24 @@ class UploadTests(unittest.IsolatedAsyncioTestCase):
         result = await protocol.probe_file_protocol(context(Provider(verify=False)), 'session')
         self.assertTrue(result['api_returned']); self.assertFalse(result['content_verified'])
 
+
+class ProbeAccessTests(unittest.IsolatedAsyncioTestCase):
+    async def test_probe_rejects_external_non_admin_without_API_call(self):
+        event = types.SimpleNamespace(get_platform_name=lambda: 'wechat_pc_hook',
+                                      role='member', plain_result=lambda text: text)
+        with patch.object(fixtures.main, 'probe_file_protocol', new_callable=AsyncMock) as probe:
+            output = [x async for x in fixtures.main.Main.hook_file_probe(None, event)]
+            probe.assert_not_awaited()
+        self.assertIn('仅允许', output[0])
+
+    async def test_probe_dashboard_and_existing_admin_can_verify(self):
+        for platform, role in [('webchat', 'member'), ('wechat_pc_hook', 'admin')]:
+            event = types.SimpleNamespace(get_platform_name=lambda: platform, role=role,
+                unified_msg_origin='test-session', plain_result=lambda text: text)
+            with patch.object(fixtures.main, 'probe_file_protocol', new_callable=AsyncMock,
+                              return_value={'content_verified': True}) as probe:
+                output = [x async for x in fixtures.main.Main.hook_file_probe(types.SimpleNamespace(context=None), event)]
+                probe.assert_awaited_once()
+            self.assertIn('验证通过', output[0])
 
 if __name__ == '__main__': unittest.main(verbosity=2)

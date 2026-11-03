@@ -26,9 +26,11 @@ class Main(Star):
             await adapter.prepare_video_input(event, req, self.context)
 
     @filter.command('hook_file_probe')
-    @filter.permission_type(filter.PermissionType.ADMIN)
     async def hook_file_probe(self, event):
-        """Verify current Responses gateway with a synthetic assembly file only."""
+        """Dashboard or existing admin only; synthetic bytes, no attachment access."""
+        if event.get_platform_name() != 'webchat' and getattr(event, 'role', '') != 'admin':
+            yield event.plain_result('文件协议探针仅允许后台 WebChat 或现有管理员使用。')
+            return
         try:
             result = await probe_file_protocol(self.context, event.unified_msg_origin)
             text = ('文件协议验证通过：当前模型从合成附件中读回了随机标记。' if result['content_verified']

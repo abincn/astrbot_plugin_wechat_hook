@@ -108,6 +108,52 @@ class FileTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(chain[0].chain[-1].name, 'archive.zip')
         self.assertEqual(Path(chain[0].chain[-1].file).read_bytes(), self.body)
 
+    async def test_capacity_rejection_waits_without_unknown_or_immediate_resubmit(self):
+        message = raw(); self.inbox.ingest_batch([message], OWNER)
+        calls = []
+        class Capacity(Exception):
+            status_code = 429
+            error_code = 'media_capacity'
+        async def request(*args, **kwargs):
+            calls.append(args); raise Capacity()
+        await media.process_pending_media(self.inbox, request, None, self.media_root)
+        self.assertEqual(self.inbox.pending_media(), [])
+        row = self.inbox.conn.execute('SELECT * FROM media_jobs').fetchone()
+        self.assertEqual(row['status'], 'new')
+        self.assertEqual(row['capacity_retries'], 1)
+        await media.process_pending_media(self.inbox, request, None, self.media_root)
+        self.assertEqual(len(calls), 1)
+        self.inbox.conn.execute('UPDATE media_jobs SET retry_after=0,capacity_retries=30')
+        await media.process_pending_media(self.inbox, request, None, self.media_root)
+        row = self.inbox.conn.execute('SELECT * FROM media_jobs').fetchone()
+        self.assertEqual(row['status'], 'failed')
+        self.assertEqual(row['error'], 'media_capacity_wait_exhausted')
+
+    async def test_uncertain_create_is_not_retried(self):
+        message = raw(); self.inbox.ingest_batch([message], OWNER)
+        calls = []
+        async def request(*args, **kwargs):
+            calls.append(args); raise TimeoutError()
+        await media.process_pending_media(self.inbox, request, None, self.media_root)
+        await media.process_pending_media(self.inbox, request, None, self.media_root)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self.inbox.conn.execute('SELECT status FROM media_jobs').fetchone()[0], 'unknown')
+
+    async def test_historical_ready_release_is_recoverable_and_keeps_local_copy(self):
+        path = self.ready()
+        self.inbox.conn.execute("UPDATE media_jobs SET task_id='old-task'")
+        calls = []
+        async def broken(method, url, **kwargs):
+            calls.append((method, url)); raise TimeoutError()
+        await media.process_pending_media(self.inbox, broken, None, self.media_root)
+        self.assertEqual(len(self.inbox.releasable_media()), 1)
+        async def released(method, url, **kwargs):
+            calls.append((method, url)); return 200, {'released': True}
+        await media.process_pending_media(self.inbox, released, None, self.media_root)
+        self.assertEqual(self.inbox.releasable_media(), [])
+        self.assertEqual(path.read_bytes(), self.body)
+        self.assertTrue(all(method == 'DELETE' for method, _ in calls))
+
     async def test_uncached_binary_task_content_handoff(self):
         quote = raw(2, name='report.docx', quote=True); self.inbox.ingest_batch([quote], OWNER)
         data = self.body; calls = []
@@ -129,6 +175,7 @@ class FileTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls[0][1]['msgsvrid'], SOURCE_ID)
         self.assertEqual(calls[0][1]['kind'], 'file')
         self.assertEqual(Path(chain[0].chain[-1].file).read_bytes(), self.body)
+        self.assertEqual(calls[-1][0], 'DELETE')
 
     def test_downstream_descriptor_has_reference_and_integrity_without_body_or_MIME_guess(self):
         message = raw(name='data.weird'); self.ready(message); event = Event(message)

@@ -84,8 +84,25 @@ def verify_task_source(task: dict, source) -> None:
             raise ValueError("Hook media source identity mismatch")
 
 
+async def release_completed_media(request, task_id: str) -> bool:
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,160}", task_id):
+        return False
+    try:
+        await request("DELETE", "/wxcx/media/tasks/" + task_id)
+        return True
+    except Exception as exc:
+        if http_status(exc) in {404, 410}:
+            return True
+        # The verified local copy remains usable even if cleanup fails.
+        log.warning(f"Hook media task release deferred: task={task_id}, error={request_error(exc)}")
+        return False
+
+
 async def process_pending_media(inbox, request, client, media_root: str | Path) -> None:
     """Advance pending Hook media tasks once; never replay an uncertain create."""
+    for retired in inbox.releasable_media():
+        if await release_completed_media(request, retired["task_id"]):
+            inbox.media_released(retired["event_id"], retired["task_id"])
     for item in inbox.pending_media():
         event_id = item["event_id"]
         try:
@@ -156,6 +173,10 @@ async def process_pending_media(inbox, request, client, media_root: str | Path) 
                 log.info(f"Hook {kind} task accepted: {task_id}, event={event_id}")
             except Exception as exc:
                 reason = request_error(exc)
+                if http_status(exc) == 429 and getattr(exc, "error_code", None) == "media_capacity":
+                    waiting = inbox.media_capacity_wait(event_id)
+                    log.warning(f"Hook {kind} admission capacity: event={event_id}, waiting={waiting}")
+                    continue
                 inbox.media_unknown(event_id, reason)
                 log.warning(f"Hook {kind} media request unresolved for event {event_id}: {reason}; no automatic resubmission")
             continue
@@ -177,6 +198,8 @@ async def process_pending_media(inbox, request, client, media_root: str | Path) 
                 reason = safe_code(task.get("error"), "hook_media_" + state)
                 inbox.media_unavailable(event_id, reason)
                 log.warning(f"Hook {kind} failed: event={event_id}, task={task_id}, error={reason}")
+                if task.get("native_pending") is False:
+                    await release_completed_media(request, task_id)
             elif state in {"unknown", "result_unknown", "timed_out", "timeout", "account_changed"}:
                 reason = safe_code(task.get("error"), "hook_media_" + state)
                 inbox.media_unknown(event_id, reason)
@@ -201,6 +224,8 @@ async def process_pending_media(inbox, request, client, media_root: str | Path) 
                 path = save_verified_media(media_root, bytes(buf), artifact, kind)
                 inbox.media_ready(event_id, str(path), artifact)
                 log.info(f"Hook {kind} ready for event {event_id}, task={task_id}")
+                if await release_completed_media(request, task_id):
+                    inbox.media_released(event_id, task_id)
         except (httpx.HTTPError, RuntimeError) as exc:
             # A status request can fail temporarily; keep the accepted task pending.
             reason = request_error(exc)

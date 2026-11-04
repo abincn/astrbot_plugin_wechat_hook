@@ -74,6 +74,10 @@ class DurableInbox:
             self.conn.execute("ALTER TABLE inbox ADD COLUMN media_kind TEXT NOT NULL DEFAULT ''")
         if "media_path" not in cols:
             self.conn.execute("ALTER TABLE inbox ADD COLUMN media_path TEXT NOT NULL DEFAULT ''")
+        media_cols = {row["name"] for row in self.conn.execute("PRAGMA table_info(media_jobs)")}
+        for column in ("retry_after", "capacity_retries"):
+            if column not in media_cols:
+                self.conn.execute(f"ALTER TABLE media_jobs ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0")
         outbound_cols = {row["name"] for row in self.conn.execute("PRAGMA table_info(outbound)")}
         if "intent_id" not in outbound_cols:
             self.conn.execute("ALTER TABLE outbound ADD COLUMN intent_id TEXT NOT NULL DEFAULT ''")
@@ -261,15 +265,25 @@ class DurableInbox:
                        msg.media_source_talker if msg else r["sender"], r["media_path"],
                        msg.quote_text if msg else "", r["last_error"])
 
+    def releasable_media(self) -> list[dict]:
+        with self._lock:
+            return [dict(row) for row in self.conn.execute(
+                "SELECT event_id,task_id FROM media_jobs WHERE status='ready' AND task_id<>'' LIMIT 24")]
+
+    def media_released(self, event_id: str, task_id: str) -> None:
+        with self._lock:
+            self.conn.execute("UPDATE media_jobs SET task_id='' WHERE event_id=? AND task_id=? AND status='ready'",
+                              (event_id, task_id))
+
     def pending_media(self, limit: int = 24) -> list[dict]:
         with self._lock:
             rows = self.conn.execute("""
                 SELECT i.event_id,i.owner,i.room,i.sender,i.kind,i.media_kind,i.raw_json,
                        j.request_id,j.task_id,j.status,j.error
                 FROM inbox i JOIN media_jobs j ON j.event_id=i.event_id
-                WHERE j.status IN ('new','pending') AND i.status='held_media'
+                WHERE j.status IN ('new','pending') AND i.status='held_media' AND j.retry_after<=?
                 ORDER BY i.sequence LIMIT ?
-            """, (limit,)).fetchall()
+            """, (int(time.time()), limit)).fetchall()
             return [dict(r) for r in rows]
 
     def ready_file(self, owner: str, room: str, *, event_id: str = "", source_id: str = "") -> dict | None:
@@ -302,6 +316,22 @@ class DurableInbox:
             cur = self.conn.execute("UPDATE media_jobs SET status='requesting',updated_at=? "
                                     "WHERE event_id=? AND status='new'", (int(time.time()), event_id))
             return cur.rowcount == 1
+
+    def media_capacity_wait(self, event_id: str) -> bool:
+        """Retry only a definite admission rejection, at most 30 times."""
+        with self._transaction():
+            row = self.conn.execute("SELECT status,task_id,capacity_retries FROM media_jobs WHERE event_id=?",
+                                    (event_id,)).fetchone()
+            if row is None or row["status"] != "requesting" or row["task_id"]:
+                return False
+            if row["capacity_retries"] >= 30:
+                self.media_failed(event_id, "media_capacity_wait_exhausted")
+                return False
+            now = int(time.time())
+            self.conn.execute("UPDATE media_jobs SET status='new',error='media_capacity',"
+                              "capacity_retries=capacity_retries+1,retry_after=?,updated_at=? WHERE event_id=?",
+                              (now + 10, now, event_id))
+            return True
 
     def media_pending(self, event_id: str, task_id: str) -> None:
         with self._lock:

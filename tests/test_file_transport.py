@@ -146,6 +146,8 @@ class FileTransportTests(unittest.IsolatedAsyncioTestCase):
         async def broken(method, url, **kwargs):
             calls.append((method, url)); raise TimeoutError()
         await media.process_pending_media(self.inbox, broken, None, self.media_root)
+        self.assertEqual(self.inbox.releasable_media(), [])
+        self.inbox.conn.execute('UPDATE media_jobs SET release_after=0')
         self.assertEqual(len(self.inbox.releasable_media()), 1)
         async def released(method, url, **kwargs):
             calls.append((method, url)); return 200, {'released': True}
@@ -153,6 +155,118 @@ class FileTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.inbox.releasable_media(), [])
         self.assertEqual(path.read_bytes(), self.body)
         self.assertTrue(all(method == 'DELETE' for method, _ in calls))
+
+    async def test_failed_task_release_retries_after_cleanup_error(self):
+        message = raw(); self.inbox.ingest_batch([message], OWNER)
+        self.inbox.begin_media(message['event_id'])
+        self.inbox.media_pending(message['event_id'], 'failed-task')
+        calls = []
+        async def request(method, url, **kwargs):
+            calls.append(method)
+            if method == 'GET':
+                return 200, dict(state='failed', error='resource_failed', native_pending=False)
+            if calls.count('DELETE') == 1:
+                raise TimeoutError()
+            return 200, {'released': True}
+        await media.process_pending_media(self.inbox, request, None, self.media_root)
+        self.assertEqual(self.inbox.pending_media(), [])
+        await media.process_pending_media(self.inbox, request, None, self.media_root)
+        self.assertEqual(calls, ['GET', 'DELETE'])
+        self.inbox.conn.execute('UPDATE media_jobs SET release_after=0')
+        await media.process_pending_media(self.inbox, request, None, self.media_root)
+        row = self.inbox.conn.execute('SELECT * FROM media_jobs').fetchone()
+        self.assertEqual(row['status'], 'failed')
+        self.assertEqual(row['task_id'], '')
+        self.assertEqual(calls, ['GET', 'DELETE', 'DELETE'])
+
+    async def test_unknown_task_cleanup_waits_for_native_completion_without_resubmit(self):
+        message = raw(); self.inbox.ingest_batch([message], OWNER)
+        self.inbox.begin_media(message['event_id'])
+        self.inbox.media_pending(message['event_id'], 'unknown-task')
+        self.inbox.media_unknown(message['event_id'], 'timeout')
+        class Pending(Exception):
+            status_code = 409
+            error_code = 'native_pending'
+        calls = []
+        async def request(method, url, **kwargs):
+            calls.append(method)
+            if len(calls) == 1: raise Pending()
+            return 200, {'released': True}
+        await media.process_pending_media(self.inbox, request, None, self.media_root)
+        await media.process_pending_media(self.inbox, request, None, self.media_root)
+        self.assertEqual(calls, ['DELETE'])
+        self.inbox.conn.execute('UPDATE media_jobs SET release_after=0')
+        await media.process_pending_media(self.inbox, request, None, self.media_root)
+        row = self.inbox.conn.execute('SELECT * FROM media_jobs').fetchone()
+        self.assertEqual(row['status'], 'unknown')
+        self.assertEqual(row['task_id'], '')
+        self.assertEqual(calls, ['DELETE', 'DELETE'])
+
+    def test_accepted_task_is_polled_before_new_backlog(self):
+        for seq in range(1, 27):
+            self.inbox.ingest_batch([raw(seq)], OWNER)
+        event_id = raw(26)['event_id']
+        self.inbox.begin_media(event_id)
+        self.inbox.media_pending(event_id, 'accepted-task')
+        self.assertEqual(self.inbox.pending_media()[0]['task_id'], 'accepted-task')
+
+    async def test_quoted_video_capacity_retry_download_and_release(self):
+        message = raw(2, quote=True)
+        message['quote'].update(message_type=43, content='', media={'kind': 'video'})
+        self.inbox.ingest_batch([message], OWNER)
+        data = b'\x00\x00\x00\x18ftypisom' + b'video payload'
+        artifact = dict(bytes=len(data), sha256=hashlib.sha256(data).hexdigest())
+        calls = []
+        request_ids = []
+        class Capacity(Exception):
+            status_code = 429
+            error_code = 'media_capacity'
+        async def request(method, url, **kwargs):
+            calls.append(method)
+            if method == 'POST':
+                payload = kwargs['data']; request_ids.append(payload['request_id'])
+                self.assertEqual(payload['kind'], 'video')
+                self.assertEqual(payload['msgsvrid'], SOURCE_ID)
+                self.assertEqual(payload['source_talker'], ROOM)
+                if len(request_ids) == 1: raise Capacity()
+                return 202, {'task_id': 'quoted-video'}
+            if method == 'GET':
+                return 200, dict(state='ready', kind='video', msgsvrid=SOURCE_ID,
+                                 source_talker=ROOM, artifact=artifact)
+            return 200, {'released': True}
+        class Content:
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): pass
+            def raise_for_status(self): pass
+            async def aiter_bytes(self): yield data
+        class Client:
+            def stream(self, *a): return Content()
+        await media.process_pending_media(self.inbox, request, Client(), self.media_root)
+        await media.process_pending_media(self.inbox, request, Client(), self.media_root)
+        self.assertEqual(calls, ['POST'])
+        self.inbox.conn.execute('UPDATE media_jobs SET retry_after=0')
+        await media.process_pending_media(self.inbox, request, Client(), self.media_root)
+        await media.process_pending_media(self.inbox, request, Client(), self.media_root)
+        self.assertEqual(calls, ['POST', 'POST', 'GET', 'DELETE'])
+        self.assertEqual(request_ids[0], request_ids[1])
+        row = self.inbox.conn.execute('SELECT * FROM media_jobs').fetchone()
+        self.assertEqual(row['status'], 'ready')
+        self.assertEqual(row['task_id'], '')
+        self.assertEqual(Path(self.pending_source(message).media_path).read_bytes(), data)
+
+    async def test_invalid_ready_artifact_is_released_on_next_poll(self):
+        message = raw(); self.inbox.ingest_batch([message], OWNER)
+        self.inbox.begin_media(message['event_id'])
+        self.inbox.media_pending(message['event_id'], 'invalid-task')
+        calls = []
+        async def request(method, url, **kwargs):
+            calls.append(method)
+            if method == 'GET': return 200, dict(state='ready', artifact={'bytes': -1})
+            return 200, {'released': True}
+        await media.process_pending_media(self.inbox, request, None, self.media_root)
+        await media.process_pending_media(self.inbox, request, None, self.media_root)
+        self.assertEqual(calls, ['GET', 'DELETE'])
+        self.assertEqual(self.inbox.conn.execute('SELECT task_id FROM media_jobs').fetchone()[0], '')
 
     async def test_uncached_binary_task_content_handoff(self):
         quote = raw(2, name='report.docx', quote=True); self.inbox.ingest_batch([quote], OWNER)

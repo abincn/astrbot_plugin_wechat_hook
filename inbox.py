@@ -75,7 +75,7 @@ class DurableInbox:
         if "media_path" not in cols:
             self.conn.execute("ALTER TABLE inbox ADD COLUMN media_path TEXT NOT NULL DEFAULT ''")
         media_cols = {row["name"] for row in self.conn.execute("PRAGMA table_info(media_jobs)")}
-        for column in ("retry_after", "capacity_retries"):
+        for column in ("retry_after", "capacity_retries", "release_after"):
             if column not in media_cols:
                 self.conn.execute(f"ALTER TABLE media_jobs ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0")
         outbound_cols = {row["name"] for row in self.conn.execute("PRAGMA table_info(outbound)")}
@@ -268,12 +268,20 @@ class DurableInbox:
     def releasable_media(self) -> list[dict]:
         with self._lock:
             return [dict(row) for row in self.conn.execute(
-                "SELECT event_id,task_id FROM media_jobs WHERE status='ready' AND task_id<>'' LIMIT 24")]
+                "SELECT event_id,task_id FROM media_jobs "
+                "WHERE status IN ('ready','failed','unknown') AND task_id<>'' AND release_after<=? "
+                "ORDER BY release_after,updated_at,event_id LIMIT 24", (int(time.time()),))]
 
     def media_released(self, event_id: str, task_id: str) -> None:
         with self._lock:
-            self.conn.execute("UPDATE media_jobs SET task_id='' WHERE event_id=? AND task_id=? AND status='ready'",
+            self.conn.execute("UPDATE media_jobs SET task_id='' WHERE event_id=? AND task_id=? "
+                              "AND status IN ('ready','failed','unknown')",
                               (event_id, task_id))
+
+    def media_release_deferred(self, event_id: str, task_id: str) -> None:
+        with self._lock:
+            self.conn.execute("UPDATE media_jobs SET release_after=? WHERE event_id=? AND task_id=?",
+                              (int(time.time()) + 10, event_id, task_id))
 
     def pending_media(self, limit: int = 24) -> list[dict]:
         with self._lock:
@@ -282,7 +290,7 @@ class DurableInbox:
                        j.request_id,j.task_id,j.status,j.error
                 FROM inbox i JOIN media_jobs j ON j.event_id=i.event_id
                 WHERE j.status IN ('new','pending') AND i.status='held_media' AND j.retry_after<=?
-                ORDER BY i.sequence LIMIT ?
+                ORDER BY CASE j.status WHEN 'pending' THEN 0 ELSE 1 END,i.sequence LIMIT ?
             """, (int(time.time()), limit)).fetchall()
             return [dict(r) for r in rows]
 

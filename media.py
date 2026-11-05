@@ -93,6 +93,8 @@ async def release_completed_media(request, task_id: str) -> bool:
     except Exception as exc:
         if http_status(exc) in {404, 410}:
             return True
+        if http_status(exc) == 409 and getattr(exc, "error_code", None) == "native_pending":
+            return False
         # The verified local copy remains usable even if cleanup fails.
         log.warning(f"Hook media task release deferred: task={task_id}, error={request_error(exc)}")
         return False
@@ -103,6 +105,8 @@ async def process_pending_media(inbox, request, client, media_root: str | Path) 
     for retired in inbox.releasable_media():
         if await release_completed_media(request, retired["task_id"]):
             inbox.media_released(retired["event_id"], retired["task_id"])
+        else:
+            inbox.media_release_deferred(retired["event_id"], retired["task_id"])
     for item in inbox.pending_media():
         event_id = item["event_id"]
         try:
@@ -199,7 +203,10 @@ async def process_pending_media(inbox, request, client, media_root: str | Path) 
                 inbox.media_unavailable(event_id, reason)
                 log.warning(f"Hook {kind} failed: event={event_id}, task={task_id}, error={reason}")
                 if task.get("native_pending") is False:
-                    await release_completed_media(request, task_id)
+                    if await release_completed_media(request, task_id):
+                        inbox.media_released(event_id, task_id)
+                    else:
+                        inbox.media_release_deferred(event_id, task_id)
             elif state in {"unknown", "result_unknown", "timed_out", "timeout", "account_changed"}:
                 reason = safe_code(task.get("error"), "hook_media_" + state)
                 inbox.media_unknown(event_id, reason)
@@ -226,6 +233,8 @@ async def process_pending_media(inbox, request, client, media_root: str | Path) 
                 log.info(f"Hook {kind} ready for event {event_id}, task={task_id}")
                 if await release_completed_media(request, task_id):
                     inbox.media_released(event_id, task_id)
+                else:
+                    inbox.media_release_deferred(event_id, task_id)
         except (httpx.HTTPError, RuntimeError) as exc:
             # A status request can fail temporarily; keep the accepted task pending.
             reason = request_error(exc)

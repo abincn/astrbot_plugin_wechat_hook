@@ -6,6 +6,7 @@ The existing WeChat Hook DLL/HTTP server is not modified.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import ipaddress
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -17,14 +18,14 @@ from astrbot.api.platform import (
     register_platform_adapter,
 )
 from astrbot.api.event import AstrMessageEvent, MessageChain
-from astrbot.api.message_components import At, Plain
+from astrbot.api.message_components import At, Image, Plain
 from .events import Inbound
 from .identity import split_session
 from .inbox import DurableInbox
 from .media import process_pending_media
 from .delivery import attach_pipeline_ack
 from .drafts import source_draft_identity
-from .outbound import NativeTextSender
+from .outbound import NativeTextSender, read_reply_image
 from .components import inbound_content, mention_components
 from .contacts import ContactNames
 from .video_inputs import VideoInputs
@@ -58,6 +59,15 @@ class HookMessageEvent(AstrMessageEvent):
     async def send(self, message: MessageChain) -> None:
         await self.adapter.send_by_session(self.session, message, origin_event=self)
         await super().send(message)
+
+    async def submit_generated_images(self, task_id: str, paths: list[str]) -> None:
+        """Submit a completed ImageGen task through its original inbound event."""
+        chain = MessageChain()
+        for path in paths:
+            chain.file_image(path)
+        await self.adapter.send_by_session(
+            self.session, chain, origin_event=self, generation_task_id=task_id,
+        )
 
     def next_draft_index(self) -> int:
         # One reply may have several independently persisted chunks.
@@ -326,7 +336,8 @@ class WeChatHookPlatform(Platform):
             await self._task_runtime.stop()
 
     async def send_by_session(self, session, message_chain: MessageChain,
-                              origin_event: HookMessageEvent | None = None) -> None:
+                              origin_event: HookMessageEvent | None = None, *,
+                              generation_task_id: str | None = None) -> None:
         owner, room = split_session(session.session_id)
         is_group = room.endswith("@chatroom")
         expected_type = MessageType.GROUP_MESSAGE if is_group else MessageType.FRIEND_MESSAGE
@@ -336,12 +347,14 @@ class WeChatHookPlatform(Platform):
             raise ValueError("Outbound destination is outside configured account")
         parts = message_chain.chain if message_chain else []
         text = "".join(p.text for p in parts if isinstance(p, Plain)).strip()
-        unsupported = [type(p).__name__ for p in parts if not isinstance(p, (Plain, At))]
+        images = [p for p in parts if isinstance(p, Image)]
+        unsupported = [type(p).__name__ for p in parts if not isinstance(p, (Plain, At, Image))]
         if unsupported and self.send_enabled:
-            raise ValueError("Native sending supports text and group @ only; disable quote/media replies")
+            raise ValueError("Native sending supports text, group @ and local PNG/JPEG images; unsupported: "
+                             + ", ".join(unsupported))
         if unsupported:
             text += "\n[Unsupported outgoing components: " + ", ".join(unsupported) + "]"
-        if not text.strip():
+        if not text.strip() and not images:
             return
         if self.send_enabled and (len(text) > 30000 or len(text.encode("utf-8")) > 32768):
             raise ValueError("Hook text exceeds 30000 characters or 32768 UTF-8 bytes; split the reply")
@@ -374,16 +387,34 @@ class WeChatHookPlatform(Platform):
         if context_is_live and isinstance(source, HookMessageEvent):
             source_event_id, intent_id = source_draft_identity(
                 source, self, session.session_id, owner, room)
-        # Unlinked/proactive messages stay drafts; only a live inbound reply may send.
+        # Unlinked/proactive messages stay drafts. ImageGen supplies the original
+        # event explicitly and reuses its intent if the completion runs twice.
         native_send = self.send_enabled and bool(source_event_id)
+        if generation_task_id is not None:
+            if not native_send:
+                raise RuntimeError("ImageGen result requires native sending and its original WeChat event")
+            key = f"{owner}\x1f{room}\x1f{source_event_id}\x1f{generation_task_id}"
+            intent_id = "imagegen-" + hashlib.sha256(key.encode("utf-8")).hexdigest()
         if native_send and (self._stopping.is_set() or self._client is None):
             raise RuntimeError("WeChat transport is not running")
-        record_id = self._inbox.record_outbound(
-            owner, room, text, "send_prepared" if native_send else "draft_only",
-            source_event_id=source_event_id, intent_id=intent_id,
-        )
         if native_send:
-            await self._sender.send_once(record_id, room, text, mentions)
+            # AstrBot and WeChat may run on different machines. Read the local
+            # files before queuing a caption, then send bytes to the Hook.
+            prepared = [await asyncio.to_thread(read_reply_image, p.path or p.file) for p in images]
+            if text.strip():
+                record_id = self._inbox.record_outbound(
+                    owner, room, text, "send_prepared", source_event_id, intent_id,
+                )
+                await self._sender.send_once(record_id, room, text, mentions)
+            for index, (data, name) in enumerate(prepared):
+                record_id = self._inbox.record_outbound(
+                    owner, room, "[Image]", "send_prepared", source_event_id,
+                    f"{intent_id}-image-{index}",
+                )
+                await self._sender.send_image_once(record_id, room, data, name)
         else:
+            if images:
+                text = "\n".join(filter(None, [text, *(["[Image]"] * len(images))]))
+            self._inbox.record_outbound(owner, room, text, "draft_only", source_event_id, intent_id)
             log.info(f"Draft persisted for {room}; no native send was requested")
         await super().send_by_session(session, message_chain)

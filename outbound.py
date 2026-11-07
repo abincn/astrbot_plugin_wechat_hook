@@ -1,12 +1,14 @@
-"""One native text submission per durable intent; never promote old drafts."""
+"""One native submission per durable intent; never promote old drafts."""
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
 import time
 import uuid
+from pathlib import Path
 
 
 log = logging.getLogger(__name__)
@@ -14,6 +16,22 @@ TASK_ID = re.compile(r"[A-Za-z0-9_-]{1,160}")
 STATES = {"requesting": "send_requesting", "queued": "send_queued",
           "submitted_unverified": "submitted_unverified",
           "unknown": "send_unknown", "failed": "send_failed"}
+IMAGE_BYTES_LIMIT = 4 * 1024 * 1024  # Hook fileData limit before hex encoding.
+
+
+def read_reply_image(location: str | None) -> tuple[bytes, str]:
+    path = Path(location or "")
+    if not path.is_absolute() or not path.is_file():
+        raise ValueError("Outgoing image must be an existing local file on AstrBot")
+    with path.open("rb") as source:
+        data = source.read(IMAGE_BYTES_LIMIT + 1)
+    if len(data) > IMAGE_BYTES_LIMIT:
+        raise ValueError("Outgoing image exceeds the Hook's 4 MiB byte upload limit")
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return data, "astrbot-image.png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return data, "astrbot-image.jpg"
+    raise ValueError("Outgoing image must be PNG or JPEG")
 
 
 class NativeTextSender:
@@ -53,7 +71,7 @@ class NativeTextSender:
                 "UPDATE inbox SET status='native_send_review',last_error=? "
                 "WHERE event_id=(SELECT source_event_id FROM outbound WHERE id=?) "
                 "AND status IN ('dispatched','processed')",
-                ("Native text submission requires review: " + error, record_id),
+                ("Native submission requires review: " + error, record_id),
             )
 
     def _reserve(self, record_id: int, payload: dict) -> str | None:
@@ -75,7 +93,7 @@ class NativeTextSender:
                     or row["room"] != payload["toid"] or row["content"] != payload["msg"]
                     or row["status"] != "send_prepared"):
                 raise ValueError("Only a new explicitly enabled reply may be submitted")
-            request_id = "astrbot-text-" + uuid.uuid4().hex
+            request_id = "astrbot-" + payload.get("kind", "text") + "-" + uuid.uuid4().hex
             self.inbox.conn.execute(
                 "INSERT INTO outbound_send_attempts"
                 "(outbound_id,payload_json,request_id,status,updated_at) VALUES(?,?,?,'requesting',?)",
@@ -90,63 +108,96 @@ class NativeTextSender:
         payload = {"toid": room, "msg": text}
         if mentions:
             payload["atlist"] = mentions
-        request_id = self._reserve(record_id, payload)
+        await self._submit(record_id, payload, "/SendAtMsg_NoSrc" if mentions else "/SendTextMsg", payload)
+
+    async def send_image_once(self, record_id: int, room: str, data: bytes, name: str):
+        # Persist the intent and digest, not private image bytes or container paths.
+        wire = {"kind": "image", "toid": room, "fileName": name}
+        intent = {**wire, "msg": "[Image]", "sha256": hashlib.sha256(data).hexdigest()}
+        await self._submit(record_id, intent, "/wxcx/outbound/tasks", {**wire, "fileData": data.hex()})
+
+    async def _submit(self, record_id: int, intent: dict, route: str, wire: dict):
+        request_id = self._reserve(record_id, intent)
         if request_id is None:
             return
+        kind = intent.get("kind", "text")
         try:
-            _, response = await self.request(
-                "POST", "/SendAtMsg_NoSrc" if mentions else "/SendTextMsg",
-                data={**payload, "request_id": request_id},
-            )
-            if (not isinstance(response, dict) or str(response.get("code")) != "0"
-                    or not (response.get("accepted") is True or response.get("replayed") is True)
-                    or not isinstance(response.get("task_id"), str)
-                    or not TASK_ID.fullmatch(response["task_id"])):
+            http_status, response = await self.request("POST", route, data={**wire, "request_id": request_id})
+            if not isinstance(response, dict):
                 raise ValueError("Unrecognized Hook send acknowledgement")
-            task_id = response["task_id"]
+            task_id = response.get("task_id")
+            if kind == "image":
+                accepted = (http_status in (200, 202) and response.get("kind") == "image"
+                            and response.get("toid") == intent["toid"])
+            else:
+                accepted = (str(response.get("code")) == "0"
+                            and (response.get("accepted") is True or response.get("replayed") is True))
+            if not accepted or not isinstance(task_id, str) or not TASK_ID.fullmatch(task_id):
+                raise ValueError("Unrecognized Hook send acknowledgement")
         except asyncio.CancelledError:
             with self.inbox._transaction():
                 self._update(record_id, "unknown", error="cancelled_before_ack")
             raise
         except Exception as exc:
             code = getattr(exc, "status_code", None)
-            state = "failed" if code in {400, 401, 403, 404, 409, 413, 422, 501} else "unknown"
+            state = "failed" if code in {400, 401, 403, 404, 409, 413, 422, 429, 501} else "unknown"
+            error = f"hook_http_{code}" if code else str(exc) or type(exc).__name__
+            if getattr(exc, "error_code", ""):
+                error += ":" + exc.error_code
             with self.inbox._transaction():
-                self._update(record_id, state, error=f"hook_http_{code}" if code else type(exc).__name__)
+                self._update(record_id, state, error=error[:250])
             raise
         with self.inbox._transaction():
             self._update(record_id, "queued", task_id)
-        log.info("Hook accepted text task %s; recipient delivery is unverified", task_id)
+        log.info("Hook accepted %s task %s; recipient delivery is unverified", kind, task_id)
 
     async def poll_once(self):
         with self.inbox._lock:
             rows = self.inbox.conn.execute(
-                "SELECT s.outbound_id,s.task_id FROM outbound_send_attempts s "
+                "SELECT s.outbound_id,s.task_id,s.payload_json FROM outbound_send_attempts s "
                 "JOIN outbound o ON o.id=s.outbound_id WHERE o.owner=? AND s.status='queued' "
                 "ORDER BY s.updated_at LIMIT 32", (self.owner,),
             ).fetchall()
         for row in rows:
+            kind = json.loads(row["payload_json"]).get("kind", "text")
+            task_id = row["task_id"]
+            route = ("/wxcx/outbound/tasks/" if kind == "image" else "/wxcx/text/tasks/") + task_id
+            release = False
             try:
-                _, response = await self.request("GET", "/wxcx/text/tasks/" + row["task_id"])
-                task = response.get("task") if isinstance(response, dict) else None
-                if not isinstance(task, dict) or task.get("task_id") != row["task_id"]:
+                _, response = await self.request("GET", route)
+                task = response if kind == "image" else response.get("task") if isinstance(response, dict) else None
+                if not isinstance(task, dict) or task.get("task_id") != task_id:
                     raise ValueError("Unrecognized Hook task status")
                 status = task.get("state")
-                if status in {"queued", "running", "submitting"}:
+                if status in {"queued", "running", "preparing", "prepared", "submitting"}:
                     continue
-                if status == "submitted" and task.get("local_submission_complete") is True:
+                if kind == "image" and task.get("native_pending") is True:
+                    continue
+                release = (kind == "image" and task.get("native_pending") is False
+                           and status in {"submitted", "failed", "timed_out", "stopped", "result_unknown"})
+                if status == "submitted" and task.get(
+                    "submission_started" if kind == "image" else "local_submission_complete"
+                ) is True:
                     status = "submitted_unverified"
+                elif status in {"timed_out", "stopped"}:
+                    status = "failed"
                 elif status != "failed":
                     status = "unknown"
-                error = "" if status == "submitted_unverified" else "hook_task_" + status
+                error = "" if status == "submitted_unverified" else str(task.get("error") or "hook_task_" + status)[:250]
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 if getattr(exc, "status_code", None) == 404 or isinstance(exc, ValueError):
                     status, error = "unknown", "hook_task_missing_or_invalid"
                 else:
-                    log.warning("Hook text status unavailable (%s)", type(exc).__name__)
+                    log.warning("Hook %s status unavailable (%s)", kind, type(exc).__name__)
                     continue
             with self.inbox._transaction():
-                self._update(row["outbound_id"], status, row["task_id"], error)
-            log.info("Hook text task %s: %s", row["task_id"], status)
+                self._update(row["outbound_id"], status, task_id, error)
+            log.info("Hook %s task %s: %s", kind, task_id, status)
+            if release:
+                try:
+                    await self.request("DELETE", route)
+                except Exception as exc:
+                    # Result is already durable; a release failure must not trigger another send.
+                    log.warning("Hook image task %s release failed: %s", task_id, exc)

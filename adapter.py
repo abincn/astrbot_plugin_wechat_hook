@@ -90,7 +90,6 @@ class HookMessageEvent(AstrMessageEvent):
         "inbox_db": "data/wechat_hook_inbox.sqlite3",
         "poll_interval": 2.0,
         "send_enabled": False,
-        "proactive_targets": "",
         "capture_enabled": False,
         "video_frames_enabled": True,
         "video_audio_enabled": True,
@@ -105,8 +104,7 @@ class HookMessageEvent(AstrMessageEvent):
         "self_wxid": {"type": "string", "description": "登录微信的 wxid"},
         "inbox_db": {"type": "string", "description": "消息数据库路径"},
         "poll_interval": {"type": "float", "description": "轮询间隔（秒）"},
-        "send_enabled": {"type": "bool", "description": "允许真实发送", "hint": "开启后，新回复会提交给微信 Hook；历史草稿不会发送。"},
-        "proactive_targets": {"type": "string", "description": "后台发送会话", "hint": "填写允许 AstrBot 后台发送的好友 ID 或群 ID，多个用空格分隔。留空关闭；需同时开启允许真实发送。"},
+        "send_enabled": {"type": "bool", "description": "允许真实发送", "hint": "开启后，聊天回复和 AstrBot 后台发送都会提交给微信 Hook；历史草稿不会发送。"},
         "capture_enabled": {"type": "bool", "description": "自动开启 Hook 消息采集", "hint": "默认关闭，避免改动现有采集配置。"},
         "video_frames_enabled": {"type": "bool", "description": "视频画面分析", "hint": "使用自带 ffmpeg 最多抽取约 0、3、9 秒的三帧；需要视觉模型。"},
         "video_audio_enabled": {"type": "bool", "description": "视频音轨识别", "hint": "提取前最多120秒音轨，调用当前会话已配置的 ASR，可能产生识别费用；未配置时明确提示。"},
@@ -118,7 +116,7 @@ class WeChatHookPlatform(Platform):
         self.owner = str(self.config.get("self_wxid") or "").strip()
         self._enabled = config_switch(self.config.get("enable", False), "enable")
         self.send_enabled = config_switch(self.config.get("send_enabled", False), "send_enabled")
-        self.proactive_targets = frozenset(str(self.config.get("proactive_targets") or "").split())
+        self.config.pop("proactive_targets", None)  # Removed after v0.6.12.
         self.capture_enabled = config_switch(self.config.get("capture_enabled", False), "capture_enabled")
         self.allow_remote_hook = config_switch(self.config.get("allow_remote_hook", False), "allow_remote_hook")
         self.video_frames_enabled = config_switch(self.config.get("video_frames_enabled", True), "video_frames_enabled")
@@ -164,7 +162,7 @@ class WeChatHookPlatform(Platform):
             name="wechat_pc_hook", description="PC WeChat Hook with persistent inbound audit",
             id=str(self.config.get("id") or "wechat_pc_hook"),
             support_streaming_message=False,
-            support_proactive_message=self.send_enabled and bool(self.proactive_targets),
+            support_proactive_message=self.send_enabled,
         )
 
     def meta(self) -> PlatformMetadata:
@@ -393,13 +391,9 @@ class WeChatHookPlatform(Platform):
                 return
             source_event_id, intent_id = source_draft_identity(
                 source, self, session.session_id, owner, room)
-        if origin_event is None:
-            # Context.send_message() treats a normal return as a send. Reject a
-            # disabled or unapproved request instead of silently saving a draft.
-            if not self.send_enabled:
-                raise PermissionError("WeChat sending is disabled (send_enabled)")
-            if not source_event_id and room not in self.proactive_targets:
-                raise PermissionError("WeChat background target is not allowed (proactive_targets)")
+        if origin_event is None and not self.send_enabled:
+            # Context.send_message() must not report a draft as a send.
+            raise PermissionError("WeChat sending is disabled (send_enabled)")
         native_send = self.send_enabled and (origin_event is None or bool(source_event_id))
         if generation_task_id is not None:
             if not native_send:

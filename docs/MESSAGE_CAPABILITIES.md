@@ -49,7 +49,7 @@
 - 位置/名片和其他特殊消息只转换收到的数据，不执行导航、加好友、进群、支付、通话等操作。
 - 部分系统事件缺少可信方向/账号/会话时仍不分发，不能凭文本虚构来源；原始事件保留程度取决于 Hook。
 - 插件原生回复支持文本、普通群 @、AstrBot 本机 PNG/JPEG（单张 4 MiB 以内，需已启用图片发送的 Hook）；图片回复尚未真机验收。`/SendQuoteMsg` 在当前 Hook 返回 `501 structured_send_unsupported`，插件尚未接通视频、文件和卡片回复。
-- AstrBot 标准 `context.send_message()` 支持后台提交上述已支持的消息类型。需打开真实发送并在 `proactive_targets` 填写目标好友或群 ID；默认不允许后台发送。接口成功返回只表示 Hook 已受理。
+- AstrBot 标准 `context.send_message()` 支持后台提交上述已支持的消息类型。开启真实发送后按 AstrBot 传入的会话发送，默认关闭。接口成功返回只表示 Hook 已受理。
 
 ## 持久化与边界
 

@@ -43,7 +43,6 @@ https://github.com/abincn/astrbot_plugin_wechat_hook
   "inbox_db": "data/wechat_hook_inbox.sqlite3",
   "poll_interval": 2,
   "send_enabled": false,
-  "proactive_targets": "",
   "capture_enabled": false
 }
 ```
@@ -328,9 +327,9 @@ v0.6.4 的文本识别/正文注入方案已撤回，请使用本版。
 
 需同时使用 ImageGen v1.8.4 的配套补丁。生图成功后，ImageGen 将该任务的本机图片交给启动任务时保存的原始微信事件，直接提交给原会话，不再启动第二轮模型。仍需开启 `send_enabled`；任务回调重复执行时复用原发送记录。日志只确认 Hook 已受理，实际收件需另行核对。未打补丁的 ImageGen 继续使用原有流程。
 
-## v0.6.12：AstrBot 标准后台发送
+## v0.6.13：AstrBot 标准后台发送
 
-在微信 Hook 平台设置中打开“允许真实发送”，将允许后台发送的好友 ID 或群 ID 填入“后台发送会话”（`proactive_targets`），多个 ID 用空格分隔。填的是微信 ID，例如 `wxid_example` 或 `123456@chatroom`，不是昵称，也不是完整的 AstrBot 会话串。留空时关闭后台发送；普通同会话回复不受名单限制。
+在微信 Hook 平台设置中打开“允许真实发送”，即可发送普通回复和后台消息。Hook 按 AstrBot 提供的会话发送，检查所属账号和会话类型。v0.6.12 的“后台发送会话”已移除，升级后旧值不再生效。
 
 应用配置后，ImageGen 等插件可通过 `context.send_message(event.unified_msg_origin, chain)` 使用标准后台发送，无需修改 ImageGen。支持文本、普通群 @ 和单张不超过 4 MiB 的本机 PNG/JPEG。账号、会话类型或权限不匹配时会报错。`Hook accepted image task` 表示 Hook 已受理；后台调用没有上游请求 ID，每次调用各自提交，失败或结果未知不会由本插件自动重发。
 

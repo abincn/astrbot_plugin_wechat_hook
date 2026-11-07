@@ -6,7 +6,7 @@
 图片、视频和入站引用的能力边界见 [AstrBot / Hook / 连接插件对比表](docs/MESSAGE_CAPABILITIES.md)。
 
 **默认只保存草稿。** 在平台设置中打开“允许真实发送”后，新产生的入站消息回复可以提交给 Hook 发送文本或群 @。
-支持同会话的本机 PNG/JPEG 图片回复；不支持无来源的主动消息、视频、文件、语音、原生引用或 @全体的发送。历史草稿不会自动发送。
+支持本机 PNG/JPEG 图片回复，也支持 AstrBot 按会话进行后台发送。视频、文件、语音、原生引用及 @全体发送暂不支持。历史草稿不会自动发送。
 任务编排和任务工作台由另一个仓库提供：[微信 Agent 任务插件](https://github.com/abincn/astrbot_plugin_wechat_agents)。
 只需要微信连接时无需安装 Agent 插件。
 
@@ -43,6 +43,7 @@ https://github.com/abincn/astrbot_plugin_wechat_hook
   "inbox_db": "data/wechat_hook_inbox.sqlite3",
   "poll_interval": 2,
   "send_enabled": false,
+  "proactive_targets": "",
   "capture_enabled": false
 }
 ```
@@ -56,16 +57,16 @@ https://github.com/abincn/astrbot_plugin_wechat_hook
 - 默认不更改 Hook 的采集配置或回调地址。先用现有 Hook 控制方式确认采集已启用。
 - 为此独立实例使用自己的数据库，不与生产接收器共用游标。
 
-日志中的 `Prepare to send` 只表示 AstrBot 进入回复流程。发送关闭时写入 `draft_only`；
-发送开启时，新回复会先落库，再用同一个已鉴权连接提交 `/SendTextMsg` 或 `/SendAtMsg_NoSrc`。
+日志中的 `Prepare to send` 只表示 AstrBot 进入回复流程。发送关闭时，入站事件的直接回复写入 `draft_only`；`context.send_message()` 会返回明确错误。
+发送开启时，回复会先落库，再通过已鉴权的 Hook 连接提交文本或图片任务。
 
 ### 开启真实发送
 
 在 **消息平台 → 微信 Hook 连接 → 编辑** 打开“允许真实发送”，保存并完整重启独立实例。
 之后在群里触发 AstrBot 正常回复。无需安装 Agent 插件；回复条件仍由 AstrBot 自身配置决定。
-若启用了引用/媒体回复，请先关闭这些暂不支持的组件；插件不会把不支持的内容伪装成已发送。
+如果启用了原生引用、视频或文件回复，请先关闭这些暂不支持的组件。
 
-发送使用 Hook 的异步文本任务协议，状态保存在同一数据库：
+发送使用 Hook 的异步任务协议，状态保存在同一数据库：
 
 | outbound 状态 | 含义 |
 | --- | --- |
@@ -326,6 +327,12 @@ v0.6.4 的文本识别/正文注入方案已撤回，请使用本版。
 ## v0.6.11：ImageGen 异步结果回传
 
 需同时使用 ImageGen v1.8.4 的配套补丁。生图成功后，ImageGen 将该任务的本机图片交给启动任务时保存的原始微信事件，直接提交给原会话，不再启动第二轮模型。仍需开启 `send_enabled`；任务回调重复执行时复用原发送记录。日志只确认 Hook 已受理，实际收件需另行核对。未打补丁的 ImageGen 继续使用原有流程。
+
+## v0.6.12：AstrBot 标准后台发送
+
+在微信 Hook 平台设置中打开“允许真实发送”，将允许后台发送的好友 ID 或群 ID 填入“后台发送会话”（`proactive_targets`），多个 ID 用空格分隔。填的是微信 ID，例如 `wxid_example` 或 `123456@chatroom`，不是昵称，也不是完整的 AstrBot 会话串。留空时关闭后台发送；普通同会话回复不受名单限制。
+
+应用配置后，ImageGen 等插件可通过 `context.send_message(event.unified_msg_origin, chain)` 使用标准后台发送，无需修改 ImageGen。支持文本、普通群 @ 和单张不超过 4 MiB 的本机 PNG/JPEG。账号、会话类型或权限不匹配时会报错。`Hook accepted image task` 表示 Hook 已受理；后台调用没有上游请求 ID，每次调用各自提交，失败或结果未知不会由本插件自动重发。
 
 ## v0.6.9：补齐媒体任务回收
 

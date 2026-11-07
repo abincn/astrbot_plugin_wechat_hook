@@ -90,6 +90,7 @@ class HookMessageEvent(AstrMessageEvent):
         "inbox_db": "data/wechat_hook_inbox.sqlite3",
         "poll_interval": 2.0,
         "send_enabled": False,
+        "proactive_targets": "",
         "capture_enabled": False,
         "video_frames_enabled": True,
         "video_audio_enabled": True,
@@ -105,6 +106,7 @@ class HookMessageEvent(AstrMessageEvent):
         "inbox_db": {"type": "string", "description": "消息数据库路径"},
         "poll_interval": {"type": "float", "description": "轮询间隔（秒）"},
         "send_enabled": {"type": "bool", "description": "允许真实发送", "hint": "开启后，新回复会提交给微信 Hook；历史草稿不会发送。"},
+        "proactive_targets": {"type": "string", "description": "后台发送会话", "hint": "填写允许 AstrBot 后台发送的好友 ID 或群 ID，多个用空格分隔。留空关闭；需同时开启允许真实发送。"},
         "capture_enabled": {"type": "bool", "description": "自动开启 Hook 消息采集", "hint": "默认关闭，避免改动现有采集配置。"},
         "video_frames_enabled": {"type": "bool", "description": "视频画面分析", "hint": "使用自带 ffmpeg 最多抽取约 0、3、9 秒的三帧；需要视觉模型。"},
         "video_audio_enabled": {"type": "bool", "description": "视频音轨识别", "hint": "提取前最多120秒音轨，调用当前会话已配置的 ASR，可能产生识别费用；未配置时明确提示。"},
@@ -116,6 +118,7 @@ class WeChatHookPlatform(Platform):
         self.owner = str(self.config.get("self_wxid") or "").strip()
         self._enabled = config_switch(self.config.get("enable", False), "enable")
         self.send_enabled = config_switch(self.config.get("send_enabled", False), "send_enabled")
+        self.proactive_targets = frozenset(str(self.config.get("proactive_targets") or "").split())
         self.capture_enabled = config_switch(self.config.get("capture_enabled", False), "capture_enabled")
         self.allow_remote_hook = config_switch(self.config.get("allow_remote_hook", False), "allow_remote_hook")
         self.video_frames_enabled = config_switch(self.config.get("video_frames_enabled", True), "video_frames_enabled")
@@ -160,7 +163,8 @@ class WeChatHookPlatform(Platform):
         self._meta = PlatformMetadata(
             name="wechat_pc_hook", description="PC WeChat Hook with persistent inbound audit",
             id=str(self.config.get("id") or "wechat_pc_hook"),
-            support_streaming_message=False, support_proactive_message=False,
+            support_streaming_message=False,
+            support_proactive_message=self.send_enabled and bool(self.proactive_targets),
         )
 
     def meta(self) -> PlatformMetadata:
@@ -377,19 +381,26 @@ class WeChatHookPlatform(Platform):
         # the source event. Background asyncio tasks inherit ContextVars and may
         # retain a stale current_message_event after the pipeline has finished.
         source = origin_event if origin_event is not None else current_message_event.get()
-        if isinstance(source, HookMessageEvent) and service_notice_reason(getattr(source.message_obj, "raw_message", None)):
-            log.info("Hook service notification reply suppressed; no native send requested")
-            return
         context_is_live = (origin_event is not None
                            or getattr(source, "_execution_active", False) is True)
         source_event_id = ""
         intent_id = ""
         if context_is_live and isinstance(source, HookMessageEvent):
+            if service_notice_reason(getattr(source.message_obj, "raw_message", None)):
+                if origin_event is None:
+                    raise PermissionError("WeChat service notification cannot trigger a send")
+                log.info("Hook service notification reply suppressed; no native send requested")
+                return
             source_event_id, intent_id = source_draft_identity(
                 source, self, session.session_id, owner, room)
-        # Unlinked/proactive messages stay drafts. ImageGen supplies the original
-        # event explicitly and reuses its intent if the completion runs twice.
-        native_send = self.send_enabled and bool(source_event_id)
+        if origin_event is None:
+            # Context.send_message() treats a normal return as a send. Reject a
+            # disabled or unapproved request instead of silently saving a draft.
+            if not self.send_enabled:
+                raise PermissionError("WeChat sending is disabled (send_enabled)")
+            if not source_event_id and room not in self.proactive_targets:
+                raise PermissionError("WeChat background target is not allowed (proactive_targets)")
+        native_send = self.send_enabled and (origin_event is None or bool(source_event_id))
         if generation_task_id is not None:
             if not native_send:
                 raise RuntimeError("ImageGen result requires native sending and its original WeChat event")
@@ -409,7 +420,7 @@ class WeChatHookPlatform(Platform):
             for index, (data, name) in enumerate(prepared):
                 record_id = self._inbox.record_outbound(
                     owner, room, "[Image]", "send_prepared", source_event_id,
-                    f"{intent_id}-image-{index}",
+                    f"{intent_id}-image-{index}" if intent_id else "",
                 )
                 await self._sender.send_image_once(record_id, room, data, name)
         else:

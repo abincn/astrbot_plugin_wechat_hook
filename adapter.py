@@ -348,7 +348,15 @@ class WeChatHookPlatform(Platform):
         if owner != self.owner:
             raise ValueError("Outbound destination is outside configured account")
         parts = message_chain.chain if message_chain else []
-        text = "".join(p.text for p in parts if isinstance(p, Plain)).strip()
+        # Preserve AstrBot's At display text as well as the native atlist below.
+        # An image-only reply with At needs this text message before its images.
+        text_parts = []
+        for part in parts:
+            if isinstance(part, Plain):
+                text_parts.append(part.text)
+            elif isinstance(part, At):
+                text_parts.append(f"@{part.name or part.qq}\u2005")
+        text = "".join(text_parts).strip()
         images = [p for p in parts if isinstance(p, Image)]
         unsupported = [type(p).__name__ for p in parts if not isinstance(p, (Plain, At, Image))]
         if unsupported and self.send_enabled:

@@ -34,6 +34,19 @@ def read_reply_image(location: str | None) -> tuple[bytes, str]:
     raise ValueError("Outgoing image must be PNG or JPEG")
 
 
+async def prepare_reply_image(image) -> tuple[bytes, str]:
+    """Resolve through AstrBot and release only resolver-owned temporary files.
+
+    Hook uploads bytes, so the resolved path need only live during this read.
+    Unlike component.to_path(), as_path() retains ownership information and
+    never deletes a caller's local file or a persistent Inbox attachment.
+    """
+    from astrbot.core.utils.media_utils import MediaResolver
+
+    async with MediaResolver(image.url or image.file, media_type="image").as_path() as resolved:
+        return await asyncio.to_thread(read_reply_image, str(resolved.path))
+
+
 class NativeTextSender:
     def __init__(self, inbox, request, owner: str):
         self.inbox, self.request, self.owner = inbox, request, owner

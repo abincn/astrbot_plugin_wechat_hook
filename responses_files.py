@@ -12,6 +12,9 @@ from .file_artifacts import MAX_FILE_BYTES, read_verified_file
 from .payloads import file_name, quoted_file_card
 
 MAX_REQUEST_FILE_BYTES = 48_000_000
+_patched_providers = []
+_registered_part = None
+_protocol_stopped = False
 
 
 class FileProtocolError(ValueError):
@@ -20,6 +23,8 @@ class FileProtocolError(ValueError):
 
 def register_file_content_part() -> None:
     """Use AstrBot's extension registry so typed agent messages retain file parts."""
+    if _protocol_stopped:
+        raise FileProtocolError('file_protocol_stopped')
     from astrbot.core.agent.message import ContentPart
     sample = file_part('probe.txt', b'')
     try:
@@ -27,11 +32,34 @@ def register_file_content_part() -> None:
         return  # Preserve a future core's existing file implementation.
     except (KeyError, ValueError, TypeError):
         pass
+    global _registered_part
     class WeChatFilePart(ContentPart):
         type: str = 'file'
         file: dict[str, str]
     # Fail explicitly if this AstrBot release cannot register the extension.
     ContentPart.model_validate(sample)
+    _registered_part = (ContentPart, WeChatFilePart)
+
+
+def restore_file_protocol() -> None:
+    """Undo only our own instance wrappers and our own content registration."""
+    global _registered_part, _protocol_stopped
+    _protocol_stopped = True
+    for provider, wrapper, had_override, original_override in reversed(_patched_providers):
+        if getattr(provider, '_convert_chat_messages_to_response_input', None) is wrapper:
+            if had_override:
+                provider._convert_chat_messages_to_response_input = original_override
+            else:
+                del provider._convert_chat_messages_to_response_input
+        if getattr(provider, '_wechat_file_protocol', None) is wrapper:
+            del provider._wechat_file_protocol
+    _patched_providers.clear()
+    if _registered_part is not None:
+        base, owned = _registered_part
+        registry = getattr(base, '_ContentPart__content_part_registry', None)
+        if registry is not None and registry.get('file') is owned:
+            del registry['file']
+        _registered_part = None
 
 
 def file_part(filename: str, data: bytes) -> dict:
@@ -104,17 +132,23 @@ def convert_with_files(original, messages: list[dict]) -> list[dict]:
 
 def enable_file_protocol(provider) -> bool:
     """Patch one existing Responses instance; file-free requests remain unchanged."""
+    if _protocol_stopped:
+        raise FileProtocolError('file_protocol_stopped')
     if provider is None or getattr(provider.meta(), 'type', None) != 'openai_responses':
         raise FileProtocolError('responses_provider_required')
-    if getattr(provider, '_wechat_file_protocol', None) == 1:
+    if any(p is provider for p, *_ in _patched_providers):
         return False
     original = getattr(provider, '_convert_chat_messages_to_response_input', None)
     if not callable(original) or list(inspect.signature(original).parameters) != ['messages']:
         raise FileProtocolError('responses_converter_incompatible')
     def convert(self, messages):
         return convert_with_files(original, messages)
-    provider._convert_chat_messages_to_response_input = types.MethodType(convert, provider)
-    provider._wechat_file_protocol = 1
+    had_override = '_convert_chat_messages_to_response_input' in vars(provider)
+    original_override = vars(provider).get('_convert_chat_messages_to_response_input')
+    wrapper = types.MethodType(convert, provider)
+    provider._convert_chat_messages_to_response_input = wrapper
+    provider._wechat_file_protocol = wrapper
+    _patched_providers.append((provider, wrapper, had_override, original_override))
     return True
 
 
@@ -129,16 +163,18 @@ async def prepare_file_upload(event, req, inbox, owner, root, context) -> bool:
         raise FileProtocolError('attachment_not_ready')
     provider = await context.get_using_provider_async(umo=event.unified_msg_origin)
     enable_file_protocol(provider)
-    # Prepare known Responses fallback instances too; don't alter other provider types.
-    for candidate in context.get_all_providers():
-        if getattr(candidate.meta(), 'type', None) == 'openai_responses':
-            enable_file_protocol(candidate)
     data = await asyncio.to_thread(read_verified_file, root, record)
     card = quoted_file_card(source.quote) if source.quote else {}
     part = file_part(card.get('title') or file_name(source.raw), data)
     register_file_content_part()
     part['_no_save'] = True  # Provider-facing only; don't persist Base64 in history.
     req.extra_user_content_parts = list(req.extra_user_content_parts or []) + [part]
+    # A fallback provider without this compatibility shim may discard file parts.
+    # Keep an explicit per-turn warning instead of implying that it read the bytes.
+    req.extra_user_content_parts.append({
+        'type': 'text', '_no_save': True,
+        'text': '[������ȡԼ����ֻ��ʵ���յ��ļ�����ʱ���ܷ�������������ǰ�ӿ�δ�ṩ�ļ����ݣ�����ȷ˵���޷���ȡ����Ҫ�����ļ�����·���²⡣]',
+    })
     event.set_extra('wechat_file_upload_request', id(req))
     event.set_extra('wechat_file_upload', {'state': 'prepared', 'bytes': len(data),
                                          'protocol': 'responses_input_file', 'accepted_by_api': False})
@@ -148,10 +184,11 @@ async def prepare_file_upload(event, req, inbox, owner, root, context) -> bool:
 async def probe_file_protocol(context, umo: str) -> dict:
     """Admin-triggered synthetic request using the existing client; no private files."""
     provider = await context.get_using_provider_async(umo=umo)
-    enable_file_protocol(provider)
+    if provider is None or getattr(provider.meta(), 'type', None) != 'openai_responses':
+        raise FileProtocolError('responses_provider_required')
     marker = 'FILEPROBE_' + secrets.token_hex(8)
     part = file_part('wxcx-probe.S', ('.section .rodata\nmarker: .asciz "' + marker + '"\n').encode())
-    converted = provider._convert_chat_messages_to_response_input([{'role': 'user', 'content': [
+    converted = convert_with_files(provider._convert_chat_messages_to_response_input, [{'role': 'user', 'content': [
         {'type': 'text', 'text': 'Return only the ASCII string defined by marker in the attached file.'}, part]}])
     client = getattr(provider, 'client', None)
     model = getattr(provider.meta(), 'model', None)

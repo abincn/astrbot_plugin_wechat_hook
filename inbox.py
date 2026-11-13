@@ -51,6 +51,10 @@ class DurableInbox:
             CREATE TABLE IF NOT EXISTS cursor (
                 name TEXT PRIMARY KEY, value INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS rejected_events (
+                fingerprint TEXT PRIMARY KEY, sequence INTEGER,
+                reason TEXT NOT NULL, preview TEXT NOT NULL, inserted_at INTEGER NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS outbound (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT NOT NULL,
                 room TEXT NOT NULL, content TEXT NOT NULL,
@@ -179,19 +183,31 @@ class DurableInbox:
         with self._transaction():
             high = self.after()
             for item in events:
-                if not isinstance(item, dict):
-                    raise ValueError("Non-object event")
-                seq = item.get("sequence", item.get("seq", 0))
-                if type(seq) not in (int, str) or not str(seq).isdigit():
-                    raise ValueError("Hook event sequence missing or invalid")
-                seq = int(seq)
-                if seq <= 0:
-                    raise ValueError("Hook event sequence missing")
-                message = normalize_event(item, owner)
-                if message is not None:
+                seq = None
+                try:
+                    if not isinstance(item, dict):
+                        raise ValueError("Non-object event")
+                    value = item.get("sequence", item.get("seq", 0))
+                    if type(value) not in (int, str) or not str(value).isascii() or not str(value).isdigit():
+                        raise ValueError("Hook event sequence missing or invalid")
+                    value = int(value)
+                    if not 0 < value <= 2**63 - 1:
+                        raise ValueError("Hook event sequence out of range")
+                    seq = value
+                    message = normalize_event(item, owner)
                     raw = json.dumps(item, ensure_ascii=False, separators=(",", ":"))
                     if len(raw.encode("utf-8")) > 96000:
-                        raise ValueError("Hook event metadata exceeds 96KB (cursor not advanced)")
+                        raise ValueError("Hook event metadata exceeds 96KB")
+                except (ValueError, TypeError, OverflowError) as exc:
+                    preview = repr(item)
+                    self.conn.execute(
+                        "INSERT OR IGNORE INTO rejected_events VALUES(?,?,?,?,?)",
+                        (stable_hash([preview]), seq, str(exc)[:250], preview[:4000], int(time.time())),
+                    )
+                    if seq is not None:
+                        high = max(high, seq)
+                    continue
+                if message is not None:
                     text_ready = not message.media_kind
                     state = "pending" if text_ready else "held_media"
                     notice_reason = message.service_notice
@@ -231,16 +247,21 @@ class DurableInbox:
                               "ON CONFLICT(name) DO UPDATE SET value=excluded.value", (high,))
             return inserted, high
 
-    def pending(self, limit: int = 64) -> list[Inbound]:
+    def pending(self, limit: int = 64, *, owner: str = "") -> list[Inbound]:
         with self._lock:
             rows = self.conn.execute("""
                 SELECT i.*
                 FROM inbox i
-                WHERE i.status='pending' ORDER BY i.sequence, i.inserted_at LIMIT ?
-            """, (limit,)).fetchall()
+                WHERE i.status='pending' AND (?='' OR i.owner=?)
+                ORDER BY i.sequence, i.inserted_at LIMIT ?
+            """, (owner, owner, limit)).fetchall()
         result = []
         for row in rows:
-            message = self._row_to_inbound(row)
+            try:
+                message = self._row_to_inbound(row)
+            except (ValueError, TypeError, KeyError) as exc:
+                self.mark_error(row["event_id"], str(exc))
+                continue
             if message.service_notice:
                 self.mark_service_notice(message.event_id, message.service_notice)
             else:
@@ -391,7 +412,7 @@ class DurableInbox:
 
     def mark_error(self, event_id: str, detail: str) -> None:
         with self._lock:
-            self.conn.execute("UPDATE inbox SET last_error=? WHERE event_id=?",
+            self.conn.execute("UPDATE inbox SET status='event_error',last_error=? WHERE event_id=? AND status='pending'",
                               (detail[:250], event_id))
 
     def record_outbound(self, owner: str, room: str, content: str, state: str,
@@ -449,6 +470,7 @@ class DurableInbox:
             media = {r["status"]: r["count"] for r in self.conn.execute(
                 "SELECT status,count(*) AS count FROM media_jobs GROUP BY status")}
             return {"cursor": self.after(), "inbox": counts, "media": media,
+                    "rejected_events": self.conn.execute("SELECT count(*) FROM rejected_events").fetchone()[0],
                     "drafts": self.conn.execute(
                         "SELECT count(*) FROM outbound WHERE status='draft_only'").fetchone()[0],
                     "draft_conflicts": self.conn.execute(

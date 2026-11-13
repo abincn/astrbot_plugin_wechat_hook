@@ -8,7 +8,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import ipaddress
-from pathlib import Path
 from urllib.parse import urlsplit
 
 import httpx
@@ -25,13 +24,14 @@ from .inbox import DurableInbox
 from .media import process_pending_media
 from .delivery import attach_pipeline_ack
 from .drafts import source_draft_identity
-from .outbound import NativeTextSender, read_reply_image
+from .outbound import NativeTextSender, prepare_reply_image
 from .components import inbound_content, mention_components
 from .contacts import ContactNames
 from .video_inputs import VideoInputs
 from .file_artifacts import attach_file_metadata
 from .responses_files import prepare_file_upload
 from .notifications import service_notice_reason
+from .storage import InboxLease, bind_inbox, inbox_path
 from astrbot.core.platform.astr_message_event import current_message_event
 
 
@@ -57,8 +57,14 @@ class HookMessageEvent(AstrMessageEvent):
         self.adapter = adapter
 
     async def send(self, message: MessageChain) -> None:
+        if not message or not message.chain:
+            return
         await self.adapter.send_by_session(self.session, message, origin_event=self)
         await super().send(message)
+
+    async def save_draft(self, message: MessageChain) -> None:
+        """Persist a preview explicitly, without AstrBot's response_sent marker."""
+        await self.adapter.send_by_session(self.session, message, origin_event=self, draft_only=True)
 
     async def submit_generated_images(self, task_id: str, paths: list[str]) -> None:
         """Submit a completed ImageGen task through its original inbound event."""
@@ -87,7 +93,7 @@ class HookMessageEvent(AstrMessageEvent):
         "hook_token": "",
         "allow_remote_hook": False,
         "self_wxid": "",
-        "inbox_db": "data/wechat_hook_inbox.sqlite3",
+        "inbox_db": "",
         "poll_interval": 2.0,
         "send_enabled": False,
         "capture_enabled": False,
@@ -95,19 +101,19 @@ class HookMessageEvent(AstrMessageEvent):
         "video_audio_enabled": True,
     },
     support_streaming_message=False,
-    adapter_display_name="微信 Hook 连接",
+    adapter_display_name="΢�� Hook ����",
     config_metadata={
-        "enable": {"type": "bool", "description": "启用连接"},
-        "hook_url": {"type": "string", "description": "Hook 地址"},
-        "hook_token": {"type": "string", "description": "Hook 访问令牌", "secret": True},
-        "allow_remote_hook": {"type": "bool", "description": "允许远程 Hook", "hint": "Linux/Docker 跨主机连接时开启，必须填写令牌。仅使用可信网络/VPN或HTTPS；不会改变Windows Hook监听设置。"},
-        "self_wxid": {"type": "string", "description": "登录微信的 wxid"},
-        "inbox_db": {"type": "string", "description": "消息数据库路径"},
-        "poll_interval": {"type": "float", "description": "轮询间隔（秒）"},
-        "send_enabled": {"type": "bool", "description": "允许真实发送", "hint": "开启后，聊天回复和 AstrBot 后台发送都会提交给微信 Hook；历史草稿不会发送。"},
-        "capture_enabled": {"type": "bool", "description": "自动开启 Hook 消息采集", "hint": "默认关闭，避免改动现有采集配置。"},
-        "video_frames_enabled": {"type": "bool", "description": "视频画面分析", "hint": "使用自带 ffmpeg 最多抽取约 0、3、9 秒的三帧；需要视觉模型。"},
-        "video_audio_enabled": {"type": "bool", "description": "视频音轨识别", "hint": "提取前最多120秒音轨，调用当前会话已配置的 ASR，可能产生识别费用；未配置时明确提示。"},
+        "enable": {"type": "bool", "description": "��������"},
+        "hook_url": {"type": "string", "description": "Hook ��ַ"},
+        "hook_token": {"type": "string", "description": "Hook ��������", "secret": True},
+        "allow_remote_hook": {"type": "bool", "description": "����Զ�� Hook", "hint": "Linux/Docker ����������ʱ������������д���ơ���ʹ�ÿ�������/VPN��HTTPS������ı�Windows Hook�������á�"},
+        "self_wxid": {"type": "string", "description": "��¼΢�ŵ� wxid"},
+        "inbox_db": {"type": "string", "description": "��Ϣ���ݿ�·��", "hint": "���հ������˺�΢���˺Ÿ��룻���ݵ�ǰ�˺ŵľ�Ĭ�����ݿ⡣��Ҫ�ö�������˹���ͬһ·����"},
+        "poll_interval": {"type": "float", "description": "��ѯ������룩"},
+        "send_enabled": {"type": "bool", "description": "������ʵ����", "hint": "����������ظ��� AstrBot ��̨���Ͷ����ύ��΢�� Hook����ʷ�ݸ岻�ᷢ�͡�"},
+        "capture_enabled": {"type": "bool", "description": "�Զ����� Hook ��Ϣ�ɼ�", "hint": "Ĭ�Ϲرգ�����Ķ����вɼ����á�"},
+        "video_frames_enabled": {"type": "bool", "description": "��Ƶ�������", "hint": "ʹ���Դ� ffmpeg ����ȡԼ 0��3��9 �����֡����Ҫ�Ӿ�ģ�͡�"},
+        "video_audio_enabled": {"type": "bool", "description": "��Ƶ����ʶ��", "hint": "��ȡǰ���120�����죬���õ�ǰ�Ự�����õ� ASR�����ܲ���ʶ����ã�δ����ʱ��ȷ��ʾ��"},
     },
 )
 class WeChatHookPlatform(Platform):
@@ -144,18 +150,28 @@ class WeChatHookPlatform(Platform):
             pass
         if not is_loopback:
             if not self.allow_remote_hook:
-                raise ValueError("Enable '允许远程 Hook' (allow_remote_hook) to connect to another host, or use a loopback tunnel")
+                raise ValueError("Enable '����Զ�� Hook' (allow_remote_hook) to connect to another host, or use a loopback tunnel")
             if not self.token:
                 raise ValueError("Remote Hook connections require hook_token")
         self.interval = max(0.5, float(self.config.get("poll_interval") or 2))
-        self._inbox = DurableInbox(Path(str(self.config.get("inbox_db") or "data/wechat_hook_inbox.sqlite3")))
-        self._inbox.reconcile_interrupted_media()
-        self._inbox.reconcile_interrupted_pipeline()
+        location = inbox_path(self.config, self.owner).resolve()
+        self._lease = InboxLease(location)
+        try:
+            self._inbox = DurableInbox(location)
+            bind_inbox(self._inbox, str(self.config["id"]), self.owner)
+            self._inbox.reconcile_interrupted_media()
+            self._inbox.reconcile_interrupted_pipeline()
+            self._sender = NativeTextSender(self._inbox, self._request, self.owner)
+        except BaseException:
+            if hasattr(self, "_inbox"):
+                self._inbox.close()
+            self._lease.close()
+            raise
         self._stopping = asyncio.Event()
-        self._media_root = Path(str(self.config.get('inbox_db') or 'data/wechat_hook_inbox.sqlite3')).resolve().parent / 'media'
+        self._run_started = False
+        self._media_root = location.parent / 'media'
         self._client: httpx.AsyncClient | None = None
         self._task_runtime = None
-        self._sender = NativeTextSender(self._inbox, self._request, self.owner)
         self._contacts = ContactNames(self._request)
         self._video_inputs = None
         self._meta = PlatformMetadata(
@@ -269,8 +285,9 @@ class WeChatHookPlatform(Platform):
                 log.info(f"Hook service notification retained; auto-reply skipped: reason={reason}")
 
     async def run(self) -> None:
+        self._run_started = True
         try:
-            if not self._enabled:
+            if not self._enabled or self._stopping.is_set():
                 return
             if not self.owner:
                 raise RuntimeError("Set self_wxid before enabling this adapter")
@@ -288,8 +305,13 @@ class WeChatHookPlatform(Platform):
                 while not self._stopping.is_set():
                     try:
                         await self._poll_once()
+                        if self.last_error is not None:
+                            self.clear_errors()
                     except (httpx.HTTPError, ValueError, RuntimeError) as exc:
-                        log.warning(f"Hook polling failed; preserving cursor: {exc}")
+                        detail = f"Hook polling failed; preserving cursor: {exc}"
+                        if self.last_error is None or self.last_error.message != detail:
+                            self.record_error(detail)
+                            log.warning(detail)
                     try:
                         await process_pending_media(
                             self._inbox, self._request, self._client, self._media_root,
@@ -301,7 +323,7 @@ class WeChatHookPlatform(Platform):
                     except Exception as exc:
                         log.warning(f"Text status processing failed ({type(exc).__name__})")
                     # Existing durable pending events are dispatched without sending.
-                    pending = await self._contacts.resolve(self._inbox.pending())
+                    pending = await self._contacts.resolve(self._inbox.pending(owner=self.owner))
                     for msg in pending:
                         try:
                             event = self.to_event(msg)
@@ -317,29 +339,42 @@ class WeChatHookPlatform(Platform):
                                 break
                         except Exception as exc:
                             self._inbox.mark_error(msg.event_id, str(exc))
-                            break
+                            log.warning(f"Hook event quarantined: {msg.event_id}: {type(exc).__name__}")
+                            continue
                     try:
                         await asyncio.wait_for(self._stopping.wait(), timeout=self.interval)
                     except asyncio.TimeoutError:
                         pass
         finally:
             self._stopping.set()
-            if self._task_runtime is not None:
-                await self._task_runtime.stop()
-            self._client = None
-            self._inbox.close()
+            try:
+                if self._task_runtime is not None:
+                    await self._task_runtime.stop()
+            finally:
+                self._client = None
+                self._inbox.close()
+                self._lease.close()
 
     def to_event(self, item: Inbound) -> AstrMessageEvent:
         return self.create_event(self.to_astrbot(item))
 
     async def terminate(self) -> None:
         self._stopping.set()
-        if self._task_runtime is not None:
-            await self._task_runtime.stop()
+        try:
+            if self._task_runtime is not None:
+                await self._task_runtime.stop()
+        finally:
+            # The manager can cancel a scheduled run before its coroutine starts.
+            if not self._run_started:
+                self._inbox.close()
+                self._lease.close()
 
     async def send_by_session(self, session, message_chain: MessageChain,
                               origin_event: HookMessageEvent | None = None, *,
-                              generation_task_id: str | None = None) -> None:
+                              generation_task_id: str | None = None,
+                              draft_only: bool = False) -> None:
+        if not draft_only and not self.send_enabled:
+            raise PermissionError("WeChat sending is disabled (send_enabled); use event.save_draft() for a preview")
         owner, room = split_session(session.session_id)
         is_group = room.endswith("@chatroom")
         expected_type = MessageType.GROUP_MESSAGE if is_group else MessageType.FRIEND_MESSAGE
@@ -359,7 +394,7 @@ class WeChatHookPlatform(Platform):
         text = "".join(text_parts).strip()
         images = [p for p in parts if isinstance(p, Image)]
         unsupported = [type(p).__name__ for p in parts if not isinstance(p, (Plain, At, Image))]
-        if unsupported and self.send_enabled:
+        if unsupported and not draft_only:
             raise ValueError("Native sending supports text, group @ and local PNG/JPEG images; unsupported: "
                              + ", ".join(unsupported))
         if unsupported:
@@ -393,16 +428,12 @@ class WeChatHookPlatform(Platform):
         intent_id = ""
         if context_is_live and isinstance(source, HookMessageEvent):
             if service_notice_reason(getattr(source.message_obj, "raw_message", None)):
-                if origin_event is None:
-                    raise PermissionError("WeChat service notification cannot trigger a send")
-                log.info("Hook service notification reply suppressed; no native send requested")
-                return
+                raise PermissionError("WeChat service notification cannot trigger a send")
             source_event_id, intent_id = source_draft_identity(
                 source, self, session.session_id, owner, room)
-        if origin_event is None and not self.send_enabled:
-            # Context.send_message() must not report a draft as a send.
-            raise PermissionError("WeChat sending is disabled (send_enabled)")
-        native_send = self.send_enabled and (origin_event is None or bool(source_event_id))
+        if not draft_only and origin_event is not None and not source_event_id:
+            raise ValueError("Reply source does not belong to this account/conversation")
+        native_send = not draft_only
         if generation_task_id is not None:
             if not native_send:
                 raise RuntimeError("ImageGen result requires native sending and its original WeChat event")
@@ -413,7 +444,9 @@ class WeChatHookPlatform(Platform):
         if native_send:
             # AstrBot and WeChat may run on different machines. Read the local
             # files before queuing a caption, then send bytes to the Hook.
-            prepared = [await asyncio.to_thread(read_reply_image, p.path or p.file) for p in images]
+            prepared = []
+            for image in images:
+                prepared.append(await prepare_reply_image(image))
             if text.strip():
                 record_id = self._inbox.record_outbound(
                     owner, room, text, "send_prepared", source_event_id, intent_id,
@@ -430,4 +463,5 @@ class WeChatHookPlatform(Platform):
                 text = "\n".join(filter(None, [text, *(["[Image]"] * len(images))]))
             self._inbox.record_outbound(owner, room, text, "draft_only", source_event_id, intent_id)
             log.info(f"Draft persisted for {room}; no native send was requested")
-        await super().send_by_session(session, message_chain)
+        if not draft_only:
+            await super().send_by_session(session, message_chain)

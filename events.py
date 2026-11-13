@@ -132,6 +132,8 @@ def normalize_event(event: dict, self_wxid: str) -> Inbound | None:
         stamp = int(float(stamp_raw))
     except (TypeError, ValueError, OverflowError):
         stamp = int(time.time())
+    if not 0 <= stamp <= 2**63 - 1:
+        raise ValueError("Hook message timestamp out of range")
     quote_text = str(quote.get("content") or quote.get("reply_text") or "")[:4500]
     sender_name = str(event.get("sender_nick") or event.get("sender_name") or sender)[:160]
     return Inbound(event_id, sequence, owner, room, sender, sender_name, text, kind,

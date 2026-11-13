@@ -1,5 +1,7 @@
 # v0.6.15 AstrBot 接口修复
 
+v0.6.18 补齐标准 `Record` 组件的原生发送映射，修复 v0.6.17 只支持文件回退、语音仍被组件白名单拒绝的问题。复用 v0.6.17 的流式上传，kind=voice；接受、查询、结果未知和释放规则与文件一致。使用 [AstrBot v4.29.4 MediaResolver](https://github.com/AstrBotDevs/AstrBot/blob/v4.29.4/astrbot/core/utils/media_utils.py) 的 audio/as_path 取得 WAV，解析器资源保持到上传结束；不截断、分段或设置时长上限。需 Hook 12 或后续兼容版，且 type_available.voice=true。入口在上传前明确记录缺失能力，提交和任务结束日志保留具体错误；不修改音乐插件，不在原生结果未知时自动补发文件。没有编写或运行测试、部署或主动发送；原生语音实际收件与播放仍待验收。
+
 v0.6.17 增加标准 `File` 出站组件：普通回复和 `context.send_message` 共用原发送入口，解析附件后通过 Hook 的 `/wxcx/outbound/upload` 流式上传，不把 AstrBot 容器路径传给 Windows。需要配套 `MULTI-VERSION-20261113-12-CANDIDATE` 或提供该入口的后续 Hook；发送入口先核对一次 binary_upload 能力，旧 DLL 明确提示升级，不上传大文件。文件种类和语音时长不由适配器过滤，上传容量沿用 Hook 的 200 MiB 文件边界。文件任务沿用持久化意图、查询、未知结果和释放规则；HTTP 202 不代表收件。本轮仅本地实现、编译与打包，尚未实际发送验收。
 
 v0.6.16 修复 GitHub v0.6.15 上传转码造成的中文名称和提示乱码，保留上述接口修复。

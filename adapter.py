@@ -19,7 +19,7 @@ from astrbot.api.platform import (
     register_platform_adapter,
 )
 from astrbot.api.event import AstrMessageEvent, MessageChain
-from astrbot.api.message_components import At, File, Image, Plain
+from astrbot.api.message_components import At, File, Image, Plain, Record
 from .events import Inbound
 from .identity import split_session
 from .inbox import DurableInbox
@@ -407,13 +407,14 @@ class WeChatHookPlatform(Platform):
         text = "".join(text_parts).strip()
         images = [p for p in parts if isinstance(p, Image)]
         files = [p for p in parts if isinstance(p, File)]
-        unsupported = [type(p).__name__ for p in parts if not isinstance(p, (Plain, At, Image, File))]
+        voices = [p for p in parts if isinstance(p, Record)]
+        unsupported = [type(p).__name__ for p in parts if not isinstance(p, (Plain, At, Image, File, Record))]
         if unsupported and not draft_only:
-            raise ValueError("Native sending supports text, group @, PNG/JPEG images and files; unsupported: "
+            raise ValueError("Native sending supports text, group @, PNG/JPEG images, files and voice; unsupported: "
                              + ", ".join(unsupported))
         if unsupported:
             text += "\n[Unsupported outgoing components: " + ", ".join(unsupported) + "]"
-        if not text.strip() and not images and not files:
+        if not text.strip() and not images and not files and not voices:
             return
         if self.send_enabled and (len(text) > 30000 or len(text.encode("utf-8")) > 32768):
             raise ValueError("Hook text exceeds 30000 characters or 32768 UTF-8 bytes; split the reply")
@@ -458,10 +459,14 @@ class WeChatHookPlatform(Platform):
         if native_send:
             # AstrBot and WeChat may run on different machines. Read the local
             # files before queuing a caption, then send bytes to the Hook.
-            if files:
+            if files or voices:
                 _, capabilities = await self._request("GET", "/wxcx/outbound/status")
                 if not isinstance(capabilities, dict) or capabilities.get("binary_upload") is not True:
-                    raise RuntimeError("Hook file upload requires MULTI-VERSION-20261113-12-CANDIDATE or newer")
+                    log.warning("Hook attachment sending unavailable: binary_upload missing; update Hook to candidate 12 or newer")
+                    raise RuntimeError("Hook attachment upload requires MULTI-VERSION-20261113-12-CANDIDATE or newer")
+                if voices and capabilities.get("type_available", {}).get("voice") is not True:
+                    log.warning("Hook voice sending unavailable: type_available.voice is not true")
+                    raise RuntimeError("Hook native voice binding is unavailable; check Hook and VoipEngine versions")
             async with AsyncExitStack() as resources:
                 prepared = []
                 for image in images:
@@ -469,6 +474,9 @@ class WeChatHookPlatform(Platform):
                 prepared_files = []
                 for component in files:
                     prepared_files.append(await resources.enter_async_context(prepare_reply_file(component)))
+                prepared_voices = []
+                for component in voices:
+                    prepared_voices.append(await resources.enter_async_context(prepare_reply_file(component, voice=True)))
                 if text.strip():
                     record_id = self._inbox.record_outbound(
                         owner, room, text, "send_prepared", source_event_id, intent_id,
@@ -485,12 +493,20 @@ class WeChatHookPlatform(Platform):
                         owner, room, "[File]", "send_prepared", source_event_id,
                         f"{intent_id}-file-{index}" if intent_id else "",
                     )
-                    await self._sender.send_file_once(record_id, room, path, name, digest)
+                    await self._sender.send_attachment_once(record_id, room, path, name, digest, kind="file")
+                for index, (path, name, digest) in enumerate(prepared_voices):
+                    record_id = self._inbox.record_outbound(
+                        owner, room, "[Voice]", "send_prepared", source_event_id,
+                        f"{intent_id}-voice-{index}" if intent_id else "",
+                    )
+                    await self._sender.send_attachment_once(record_id, room, path, name, digest, kind="voice")
         else:
             if images:
                 text = "\n".join(filter(None, [text, *(["[Image]"] * len(images))]))
             if files:
                 text = "\n".join(filter(None, [text, *(["[File]"] * len(files))]))
+            if voices:
+                text = "\n".join(filter(None, [text, *(["[Voice]"] * len(voices))]))
             self._inbox.record_outbound(owner, room, text, "draft_only", source_event_id, intent_id)
             log.info(f"Draft persisted for {room}; no native send was requested")
         if not draft_only:

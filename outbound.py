@@ -49,12 +49,13 @@ async def prepare_reply_image(image) -> tuple[bytes, str]:
 
 
 @asynccontextmanager
-async def prepare_reply_file(component):
+async def prepare_reply_file(component, *, voice: bool = False):
     from astrbot.core.utils.media_utils import MediaResolver
 
-    async with MediaResolver(component.url or component.file_, media_type="file").as_path() as resolved:
+    reference = (component.url or component.path or component.file) if voice else (component.url or component.file_)
+    async with MediaResolver(reference, media_type="audio" if voice else "file").as_path() as resolved:
         path = Path(resolved.path)
-        name = (component.name or path.name).replace("\\", "/").rsplit("/", 1)[-1]
+        name = "astrbot-voice.wav" if voice else (component.name or path.name).replace("\\", "/").rsplit("/", 1)[-1]
         def digest():
             sha = hashlib.sha256()
             with path.open("rb") as source:
@@ -146,9 +147,9 @@ class NativeTextSender:
         intent = {**wire, "msg": "[Image]", "sha256": hashlib.sha256(data).hexdigest()}
         await self._submit(record_id, intent, "/wxcx/outbound/tasks", {**wire, "fileData": data.hex()})
 
-    async def send_file_once(self, record_id: int, room: str, path: Path, name: str, digest: str):
-        wire = {"kind": "file", "toid": room, "fileName": name}
-        intent = {**wire, "msg": "[File]", "sha256": digest}
+    async def send_attachment_once(self, record_id: int, room: str, path: Path, name: str, digest: str, *, kind: str):
+        wire = {"kind": kind, "toid": room, "fileName": name}
+        intent = {**wire, "msg": "[Voice]" if kind == "voice" else "[File]", "sha256": digest}
         await self._submit(record_id, intent, "/wxcx/outbound/upload", wire, upload=path)
 
     async def _submit(self, record_id: int, intent: dict, route: str, wire: dict, *, upload: Path | None = None):
@@ -164,7 +165,7 @@ class NativeTextSender:
             if not isinstance(response, dict):
                 raise ValueError("Unrecognized Hook send acknowledgement")
             task_id = response.get("task_id")
-            if kind in {"image", "file"}:
+            if kind in {"image", "file", "voice"}:
                 accepted = (http_status in (200, 202) and response.get("kind") == kind
                             and response.get("toid") == intent["toid"])
             else:
@@ -184,6 +185,7 @@ class NativeTextSender:
                 error += ":" + exc.error_code
             with self.inbox._transaction():
                 self._update(record_id, state, error=error[:250])
+            log.warning("Hook %s submission %s: %s", kind, state, error[:250])
             raise
         with self.inbox._transaction():
             self._update(record_id, "queued", task_id)
@@ -199,7 +201,7 @@ class NativeTextSender:
         for row in rows:
             kind = json.loads(row["payload_json"]).get("kind", "text")
             task_id = row["task_id"]
-            media = kind in {"image", "file"}
+            media = kind in {"image", "file", "voice"}
             route = ("/wxcx/outbound/tasks/" if media else "/wxcx/text/tasks/") + task_id
             release = False
             try:
@@ -233,7 +235,7 @@ class NativeTextSender:
                     continue
             with self.inbox._transaction():
                 self._update(row["outbound_id"], status, task_id, error)
-            log.info("Hook %s task %s: %s", kind, task_id, status)
+            log.info("Hook %s task %s: %s; error=%s", kind, task_id, status, error or "none")
             if release:
                 try:
                     await self.request("DELETE", route)

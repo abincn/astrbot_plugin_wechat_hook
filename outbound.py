@@ -258,6 +258,9 @@ class NativeTextSender:
                 error = "" if status == "submitted_unverified" else str(task.get("error") or "hook_task_" + status)[:250]
                 if media and error:
                     error += f"; native_code={task.get('native_code')}; native_detail={task.get('native_detail')}"
+                if kind == "voice":
+                    log.info("Hook voice task %s segments submitted=%s total=%s; delivery unverified",
+                             task_id, task.get("segments_submitted"), task.get("segments_total"))
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

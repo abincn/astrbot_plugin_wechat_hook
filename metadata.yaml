@@ -1,7 +1,7 @@
 name: astrbot_plugin_wechat_hook
 display_name: 微信 Hook 连接
 desc: WeChat Hook transport, durable Inbox and opt-in native text, group mentions, image, file and voice replies. Sending defaults off. Group policy belongs to the separate Agent plugin.
-version: 0.6.19
+version: 0.6.20
 astrbot_version: ">=4.29.4,<5"
 author: abincn
 repo: https://github.com/abincn/astrbot_plugin_wechat_hook

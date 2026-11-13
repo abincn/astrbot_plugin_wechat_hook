@@ -101,19 +101,19 @@ class HookMessageEvent(AstrMessageEvent):
         "video_audio_enabled": True,
     },
     support_streaming_message=False,
-    adapter_display_name="΢�� Hook ����",
+    adapter_display_name="微信 Hook 连接",
     config_metadata={
-        "enable": {"type": "bool", "description": "��������"},
-        "hook_url": {"type": "string", "description": "Hook ��ַ"},
-        "hook_token": {"type": "string", "description": "Hook ��������", "secret": True},
-        "allow_remote_hook": {"type": "bool", "description": "����Զ�� Hook", "hint": "Linux/Docker ����������ʱ������������д���ơ���ʹ�ÿ�������/VPN��HTTPS������ı�Windows Hook�������á�"},
-        "self_wxid": {"type": "string", "description": "��¼΢�ŵ� wxid"},
-        "inbox_db": {"type": "string", "description": "��Ϣ���ݿ�·��", "hint": "���հ������˺�΢���˺Ÿ��룻���ݵ�ǰ�˺ŵľ�Ĭ�����ݿ⡣��Ҫ�ö�������˹���ͬһ·����"},
-        "poll_interval": {"type": "float", "description": "��ѯ������룩"},
-        "send_enabled": {"type": "bool", "description": "������ʵ����", "hint": "����������ظ��� AstrBot ��̨���Ͷ����ύ��΢�� Hook����ʷ�ݸ岻�ᷢ�͡�"},
-        "capture_enabled": {"type": "bool", "description": "�Զ����� Hook ��Ϣ�ɼ�", "hint": "Ĭ�Ϲرգ�����Ķ����вɼ����á�"},
-        "video_frames_enabled": {"type": "bool", "description": "��Ƶ�������", "hint": "ʹ���Դ� ffmpeg ����ȡԼ 0��3��9 �����֡����Ҫ�Ӿ�ģ�͡�"},
-        "video_audio_enabled": {"type": "bool", "description": "��Ƶ����ʶ��", "hint": "��ȡǰ���120�����죬���õ�ǰ�Ự�����õ� ASR�����ܲ���ʶ����ã�δ����ʱ��ȷ��ʾ��"},
+        "enable": {"type": "bool", "description": "启用连接"},
+        "hook_url": {"type": "string", "description": "Hook 地址"},
+        "hook_token": {"type": "string", "description": "Hook 访问令牌", "secret": True},
+        "allow_remote_hook": {"type": "bool", "description": "允许远程 Hook", "hint": "Linux/Docker 跨主机连接时开启，必须填写令牌。仅使用可信网络/VPN或HTTPS；不会改变Windows Hook监听设置。"},
+        "self_wxid": {"type": "string", "description": "登录微信的 wxid"},
+        "inbox_db": {"type": "string", "description": "消息数据库路径", "hint": "留空按机器人和微信账号隔离；兼容当前账号的旧默认数据库。不要让多个机器人共用同一路径。"},
+        "poll_interval": {"type": "float", "description": "轮询间隔（秒）"},
+        "send_enabled": {"type": "bool", "description": "允许真实发送", "hint": "开启后，聊天回复和 AstrBot 后台发送都会提交给微信 Hook；历史草稿不会发送。"},
+        "capture_enabled": {"type": "bool", "description": "自动开启 Hook 消息采集", "hint": "默认关闭，避免改动现有采集配置。"},
+        "video_frames_enabled": {"type": "bool", "description": "视频画面分析", "hint": "使用自带 ffmpeg 最多抽取约 0、3、9 秒的三帧；需要视觉模型。"},
+        "video_audio_enabled": {"type": "bool", "description": "视频音轨识别", "hint": "提取前最多120秒音轨，调用当前会话已配置的 ASR，可能产生识别费用；未配置时明确提示。"},
     },
 )
 class WeChatHookPlatform(Platform):
@@ -150,7 +150,7 @@ class WeChatHookPlatform(Platform):
             pass
         if not is_loopback:
             if not self.allow_remote_hook:
-                raise ValueError("Enable '����Զ�� Hook' (allow_remote_hook) to connect to another host, or use a loopback tunnel")
+                raise ValueError("Enable '允许远程 Hook' (allow_remote_hook) to connect to another host, or use a loopback tunnel")
             if not self.token:
                 raise ValueError("Remote Hook connections require hook_token")
         self.interval = max(0.5, float(self.config.get("poll_interval") or 2))

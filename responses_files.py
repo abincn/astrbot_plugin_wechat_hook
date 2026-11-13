@@ -173,7 +173,7 @@ async def prepare_file_upload(event, req, inbox, owner, root, context) -> bool:
     # Keep an explicit per-turn warning instead of implying that it read the bytes.
     req.extra_user_content_parts.append({
         'type': 'text', '_no_save': True,
-        'text': '[������ȡԼ����ֻ��ʵ���յ��ļ�����ʱ���ܷ�������������ǰ�ӿ�δ�ṩ�ļ����ݣ�����ȷ˵���޷���ȡ����Ҫ�����ļ�����·���²⡣]',
+        'text': '[附件读取约定：只有实际收到文件内容时才能分析附件；若当前接口未提供文件内容，请明确说明无法读取，不要根据文件名或路径猜测。]',
     })
     event.set_extra('wechat_file_upload_request', id(req))
     event.set_extra('wechat_file_upload', {'state': 'prepared', 'bytes': len(data),

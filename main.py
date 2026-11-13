@@ -59,20 +59,20 @@ class Main(Star):
                 log.warning(f"Hook attachment protocol preparation failed: {code}")
                 # A file error must be visible; never silently claim to have uploaded it.
                 req.extra_user_content_parts = list(req.extra_user_content_parts or []) + [
-                    {'type': 'text', 'text': '[����δ��Ϊ�ļ��ɹ��ύ��' + code + '������ȷ˵���޷���ȡ��������Ҫ����·�������Ʋ²����ݡ�]'}]
+                    {'type': 'text', 'text': '[附件未作为文件成功提交：' + code + '。请明确说明无法读取附件，不要根据路径或名称猜测内容。]'}]
             await adapter.prepare_video_input(event, req, self.context)
 
     @filter.command('hook_file_probe')
     async def hook_file_probe(self, event):
         """Dashboard or existing admin only; synthetic bytes, no attachment access."""
         if event.get_platform_name() != 'webchat' and getattr(event, 'role', '') != 'admin':
-            yield event.plain_result('�ļ�Э��̽���������̨ WebChat �����й���Աʹ�á�')
+            yield event.plain_result('文件协议探针仅允许后台 WebChat 或现有管理员使用。')
             return
         try:
             result = await probe_file_protocol(self.context, event.unified_msg_origin)
-            text = ('�ļ�Э����֤ͨ������ǰģ�ʹӺϳɸ����ж����������ǡ�' if result['content_verified']
-                    else '�ӿ��ѷ��أ���û�ж��ظ��������ǣ��в���֤���ļ����ݿ��á�')
+            text = ('文件协议验证通过：当前模型从合成附件中读回了随机标记。' if result['content_verified']
+                    else '接口已返回，但没有读回附件随机标记，尚不能证明文件内容可用。')
         except Exception as exc:
             status = getattr(exc, 'status_code', None)
-            text = '�ļ�Э����֤ʧ�ܣ�' + type(exc).__name__ + (f'��HTTP {status}' if status else '')
-        yield event.plain_result(text + ' ����δ�ϴ���ʵ���츽����')
+            text = '文件协议验证失败：' + type(exc).__name__ + (f'，HTTP {status}' if status else '')
+        yield event.plain_result(text + ' 本次未上传真实聊天附件。')

@@ -8,6 +8,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import ipaddress
+from contextlib import AsyncExitStack
+from pathlib import Path
 from urllib.parse import urlsplit
 
 import httpx
@@ -17,14 +19,14 @@ from astrbot.api.platform import (
     register_platform_adapter,
 )
 from astrbot.api.event import AstrMessageEvent, MessageChain
-from astrbot.api.message_components import At, Image, Plain
+from astrbot.api.message_components import At, File, Image, Plain
 from .events import Inbound
 from .identity import split_session
 from .inbox import DurableInbox
 from .media import process_pending_media
 from .delivery import attach_pipeline_ack
 from .drafts import source_draft_identity
-from .outbound import NativeTextSender, prepare_reply_image
+from .outbound import NativeTextSender, prepare_reply_file, prepare_reply_image
 from .components import inbound_content, mention_components
 from .contacts import ContactNames
 from .video_inputs import VideoInputs
@@ -244,9 +246,20 @@ class WeChatHookPlatform(Platform):
             event.set_extra('wechat_workspace_id', self._inbox.workspace_id(message.self_id, message.group_id))
         return event
 
-    async def _request(self, method: str, route: str, *, data: dict | None = None) -> tuple[int, dict | list]:
+    async def _request(self, method: str, route: str, *, data: dict | None = None,
+                       upload: Path | None = None) -> tuple[int, dict | list]:
         assert self._client is not None
-        resp = await self._client.request(method, route, json=data)
+        if upload is None:
+            resp = await self._client.request(method, route, json=data)
+        else:
+            async def chunks():
+                with upload.open("rb") as source:
+                    while chunk := await asyncio.to_thread(source.read, 65536):
+                        yield chunk
+            resp = await self._client.request(
+                method, route, params=data, content=chunks(),
+                headers={"Content-Type": "application/octet-stream"},
+            )
         if resp.status_code >= 400:
             error_code = ""
             try:
@@ -393,13 +406,14 @@ class WeChatHookPlatform(Platform):
                 text_parts.append(f"@{part.name or part.qq}\u2005")
         text = "".join(text_parts).strip()
         images = [p for p in parts if isinstance(p, Image)]
-        unsupported = [type(p).__name__ for p in parts if not isinstance(p, (Plain, At, Image))]
+        files = [p for p in parts if isinstance(p, File)]
+        unsupported = [type(p).__name__ for p in parts if not isinstance(p, (Plain, At, Image, File))]
         if unsupported and not draft_only:
-            raise ValueError("Native sending supports text, group @ and local PNG/JPEG images; unsupported: "
+            raise ValueError("Native sending supports text, group @, PNG/JPEG images and files; unsupported: "
                              + ", ".join(unsupported))
         if unsupported:
             text += "\n[Unsupported outgoing components: " + ", ".join(unsupported) + "]"
-        if not text.strip() and not images:
+        if not text.strip() and not images and not files:
             return
         if self.send_enabled and (len(text) > 30000 or len(text.encode("utf-8")) > 32768):
             raise ValueError("Hook text exceeds 30000 characters or 32768 UTF-8 bytes; split the reply")
@@ -444,23 +458,39 @@ class WeChatHookPlatform(Platform):
         if native_send:
             # AstrBot and WeChat may run on different machines. Read the local
             # files before queuing a caption, then send bytes to the Hook.
-            prepared = []
-            for image in images:
-                prepared.append(await prepare_reply_image(image))
-            if text.strip():
-                record_id = self._inbox.record_outbound(
-                    owner, room, text, "send_prepared", source_event_id, intent_id,
-                )
-                await self._sender.send_once(record_id, room, text, mentions)
-            for index, (data, name) in enumerate(prepared):
-                record_id = self._inbox.record_outbound(
-                    owner, room, "[Image]", "send_prepared", source_event_id,
-                    f"{intent_id}-image-{index}" if intent_id else "",
-                )
-                await self._sender.send_image_once(record_id, room, data, name)
+            if files:
+                _, capabilities = await self._request("GET", "/wxcx/outbound/status")
+                if not isinstance(capabilities, dict) or capabilities.get("binary_upload") is not True:
+                    raise RuntimeError("Hook file upload requires MULTI-VERSION-20261113-12-CANDIDATE or newer")
+            async with AsyncExitStack() as resources:
+                prepared = []
+                for image in images:
+                    prepared.append(await prepare_reply_image(image))
+                prepared_files = []
+                for component in files:
+                    prepared_files.append(await resources.enter_async_context(prepare_reply_file(component)))
+                if text.strip():
+                    record_id = self._inbox.record_outbound(
+                        owner, room, text, "send_prepared", source_event_id, intent_id,
+                    )
+                    await self._sender.send_once(record_id, room, text, mentions)
+                for index, (data, name) in enumerate(prepared):
+                    record_id = self._inbox.record_outbound(
+                        owner, room, "[Image]", "send_prepared", source_event_id,
+                        f"{intent_id}-image-{index}" if intent_id else "",
+                    )
+                    await self._sender.send_image_once(record_id, room, data, name)
+                for index, (path, name, digest) in enumerate(prepared_files):
+                    record_id = self._inbox.record_outbound(
+                        owner, room, "[File]", "send_prepared", source_event_id,
+                        f"{intent_id}-file-{index}" if intent_id else "",
+                    )
+                    await self._sender.send_file_once(record_id, room, path, name, digest)
         else:
             if images:
                 text = "\n".join(filter(None, [text, *(["[Image]"] * len(images))]))
+            if files:
+                text = "\n".join(filter(None, [text, *(["[File]"] * len(files))]))
             self._inbox.record_outbound(owner, room, text, "draft_only", source_event_id, intent_id)
             log.info(f"Draft persisted for {room}; no native send was requested")
         if not draft_only:

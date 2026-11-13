@@ -8,6 +8,7 @@ import logging
 import re
 import time
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 
@@ -45,6 +46,22 @@ async def prepare_reply_image(image) -> tuple[bytes, str]:
 
     async with MediaResolver(image.url or image.file, media_type="image").as_path() as resolved:
         return await asyncio.to_thread(read_reply_image, str(resolved.path))
+
+
+@asynccontextmanager
+async def prepare_reply_file(component):
+    from astrbot.core.utils.media_utils import MediaResolver
+
+    async with MediaResolver(component.url or component.file_, media_type="file").as_path() as resolved:
+        path = Path(resolved.path)
+        name = (component.name or path.name).replace("\\", "/").rsplit("/", 1)[-1]
+        def digest():
+            sha = hashlib.sha256()
+            with path.open("rb") as source:
+                while chunk := source.read(65536):
+                    sha.update(chunk)
+            return sha.hexdigest()
+        yield path, name, await asyncio.to_thread(digest)
 
 
 class NativeTextSender:
@@ -129,18 +146,26 @@ class NativeTextSender:
         intent = {**wire, "msg": "[Image]", "sha256": hashlib.sha256(data).hexdigest()}
         await self._submit(record_id, intent, "/wxcx/outbound/tasks", {**wire, "fileData": data.hex()})
 
-    async def _submit(self, record_id: int, intent: dict, route: str, wire: dict):
+    async def send_file_once(self, record_id: int, room: str, path: Path, name: str, digest: str):
+        wire = {"kind": "file", "toid": room, "fileName": name}
+        intent = {**wire, "msg": "[File]", "sha256": digest}
+        await self._submit(record_id, intent, "/wxcx/outbound/upload", wire, upload=path)
+
+    async def _submit(self, record_id: int, intent: dict, route: str, wire: dict, *, upload: Path | None = None):
         request_id = self._reserve(record_id, intent)
         if request_id is None:
             return
         kind = intent.get("kind", "text")
         try:
-            http_status, response = await self.request("POST", route, data={**wire, "request_id": request_id})
+            options = {"data": {**wire, "request_id": request_id}}
+            if upload is not None:
+                options["upload"] = upload
+            http_status, response = await self.request("POST", route, **options)
             if not isinstance(response, dict):
                 raise ValueError("Unrecognized Hook send acknowledgement")
             task_id = response.get("task_id")
-            if kind == "image":
-                accepted = (http_status in (200, 202) and response.get("kind") == "image"
+            if kind in {"image", "file"}:
+                accepted = (http_status in (200, 202) and response.get("kind") == kind
                             and response.get("toid") == intent["toid"])
             else:
                 accepted = (str(response.get("code")) == "0"
@@ -153,7 +178,7 @@ class NativeTextSender:
             raise
         except Exception as exc:
             code = getattr(exc, "status_code", None)
-            state = "failed" if code in {400, 401, 403, 404, 409, 413, 422, 429, 501} else "unknown"
+            state = "failed" if code in {400, 401, 403, 404, 409, 410, 413, 415, 422, 429, 501} else "unknown"
             error = f"hook_http_{code}" if code else str(exc) or type(exc).__name__
             if getattr(exc, "error_code", ""):
                 error += ":" + exc.error_code
@@ -174,22 +199,23 @@ class NativeTextSender:
         for row in rows:
             kind = json.loads(row["payload_json"]).get("kind", "text")
             task_id = row["task_id"]
-            route = ("/wxcx/outbound/tasks/" if kind == "image" else "/wxcx/text/tasks/") + task_id
+            media = kind in {"image", "file"}
+            route = ("/wxcx/outbound/tasks/" if media else "/wxcx/text/tasks/") + task_id
             release = False
             try:
                 _, response = await self.request("GET", route)
-                task = response if kind == "image" else response.get("task") if isinstance(response, dict) else None
+                task = response if media else response.get("task") if isinstance(response, dict) else None
                 if not isinstance(task, dict) or task.get("task_id") != task_id:
                     raise ValueError("Unrecognized Hook task status")
                 status = task.get("state")
                 if status in {"queued", "running", "preparing", "prepared", "submitting"}:
                     continue
-                if kind == "image" and task.get("native_pending") is True:
+                if media and task.get("native_pending") is True:
                     continue
-                release = (kind == "image" and task.get("native_pending") is False
+                release = (media and task.get("native_pending") is False
                            and status in {"submitted", "failed", "timed_out", "stopped", "result_unknown"})
                 if status == "submitted" and task.get(
-                    "submission_started" if kind == "image" else "local_submission_complete"
+                    "submission_started" if media else "local_submission_complete"
                 ) is True:
                     status = "submitted_unverified"
                 elif status in {"timed_out", "stopped"}:
@@ -213,4 +239,4 @@ class NativeTextSender:
                     await self.request("DELETE", route)
                 except Exception as exc:
                     # Result is already durable; a release failure must not trigger another send.
-                    log.warning("Hook image task %s release failed: %s", task_id, exc)
+                    log.warning("Hook %s task %s release failed: %s", kind, task_id, exc)

@@ -6,9 +6,9 @@
 图片、视频和入站引用的能力边界见 [AstrBot / Hook / 连接插件对比表](docs/MESSAGE_CAPABILITIES.md)。
 
 **默认关闭发送。** 标准发送入口在关闭时明确报错；显式草稿使用 `await event.save_draft(chain)`，不会被标记为已发送。在平台设置中打开“允许真实发送”后，新回复可以提交给 Hook 发送文本或群 @。
-图片通过 AstrBot 标准解析器支持本地路径、URL、file URI 和 Base64，解析后只发送 4 MiB 以内的 PNG/JPEG；也支持 AstrBot 按会话进行后台发送。视频、文件、语音、原生引用及 @全体发送暂不支持。历史草稿不会自动发送。
+图片通过 AstrBot 标准解析器支持本地路径、URL、file URI 和 Base64，解析后只发送 4 MiB 以内的 PNG/JPEG；也支持 AstrBot 按会话进行后台发送。标准 `File` 组件通过流式上传发送原文件，包括音乐插件回退的音频文件，不按扩展名或时长过滤；文件容量沿用 Hook 的 200 MiB 上限。需配套 `MULTI-VERSION-20261113-12-CANDIDATE` 或支持 `/wxcx/outbound/upload` 的后续 Hook。视频、语音气泡、原生引用及 @全体发送暂不支持。历史草稿不会自动发送。
 
-v0.6.16 要求 AstrBot >=4.29.4,<5。升级说明见 [接口兼容与数据说明](docs/ADAPTER-COMPATIBILITY.md)。从旧版本升级请完整重启一次 AstrBot，以清除旧版本未登记的 Provider 兼容修改。
+v0.6.17 要求 AstrBot >=4.29.4,<5。升级说明见 [接口兼容与数据说明](docs/ADAPTER-COMPATIBILITY.md)。从旧版本升级请完整重启一次 AstrBot，以清除旧版本未登记的 Provider 兼容修改。
 任务编排和任务工作台由另一个仓库提供：[微信 Agent 任务插件](https://github.com/abincn/astrbot_plugin_wechat_agents)。
 只需要微信连接时无需安装 Agent 插件。
 

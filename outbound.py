@@ -4,15 +4,14 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import logging
 import re
 import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
+from astrbot.api import logger as log
 
 
-log = logging.getLogger(__name__)
 TASK_ID = re.compile(r"[A-Za-z0-9_-]{1,160}")
 STATES = {"requesting": "send_requesting", "queued": "send_queued",
           "submitted_unverified": "submitted_unverified",
@@ -87,6 +86,15 @@ class NativeTextSender:
             ).fetchall()
             for row in interrupted:
                 self._update(row["outbound_id"], "unknown", error="interrupted_before_ack")
+            recent = inbox.conn.execute(
+                "SELECT s.status,s.task_id,s.error,s.payload_json FROM outbound_send_attempts s "
+                "JOIN outbound o ON o.id=s.outbound_id WHERE o.owner=? "
+                "ORDER BY s.updated_at DESC,s.outbound_id DESC LIMIT 5", (owner,),
+            ).fetchall()
+        for row in recent:
+            kind = json.loads(row["payload_json"]).get("kind", "text")
+            log.info("Recovered Hook %s task %s: %s; error=%s",
+                     kind, row["task_id"], row["status"], row["error"] or "none")
 
     def _update(self, record_id: int, status: str, task_id: str = "", error: str = ""):
         self.inbox.conn.execute(
@@ -151,6 +159,29 @@ class NativeTextSender:
         wire = {"kind": kind, "toid": room, "fileName": name}
         intent = {**wire, "msg": "[Voice]" if kind == "voice" else "[File]", "sha256": digest}
         await self._submit(record_id, intent, "/wxcx/outbound/upload", wire, upload=path)
+        if kind == "voice":
+            # The music caller may fall back to File on a definite rejection.
+            # Queue acceptance alone cannot decide that. Read the durable result
+            # written by poll_once(), which also owns native task release.
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 300  # Existing Hook task wait, not audio duration.
+            while True:
+                with self.inbox._lock:
+                    result = self.inbox.conn.execute(
+                        "SELECT status,task_id,error FROM outbound_send_attempts WHERE outbound_id=?",
+                        (record_id,),
+                    ).fetchone()
+                if result["status"] == "submitted_unverified":
+                    return
+                if result["status"] == "failed":
+                    raise RuntimeError(f"Hook voice task {result['task_id']} failed: {result['error']}")
+                if result["status"] == "unknown" or loop.time() >= deadline:
+                    log.warning(
+                        "Hook voice task %s completion unconfirmed: %s; no automatic file fallback",
+                        result["task_id"], result["error"] or "native_task_wait_elapsed",
+                    )
+                    return
+                await asyncio.sleep(0.5)
 
     async def _submit(self, record_id: int, intent: dict, route: str, wire: dict, *, upload: Path | None = None):
         request_id = self._reserve(record_id, intent)
@@ -225,6 +256,8 @@ class NativeTextSender:
                 elif status != "failed":
                     status = "unknown"
                 error = "" if status == "submitted_unverified" else str(task.get("error") or "hook_task_" + status)[:250]
+                if media and error:
+                    error += f"; native_code={task.get('native_code')}; native_detail={task.get('native_detail')}"
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

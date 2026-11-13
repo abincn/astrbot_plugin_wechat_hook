@@ -334,7 +334,7 @@ class WeChatHookPlatform(Platform):
                     try:
                         await self._sender.poll_once()
                     except Exception as exc:
-                        log.warning(f"Text status processing failed ({type(exc).__name__})")
+                        log.warning(f"Native send status processing failed: {exc}")
                     # Existing durable pending events are dispatched without sending.
                     pending = await self._contacts.resolve(self._inbox.pending(owner=self.owner))
                     for msg in pending:

@@ -52,14 +52,17 @@ def emoji_source(content: str) -> tuple[str, str]:
         return "", ""
     parsed = urlsplit(url)
     # Separate public CDN client; never forward the local Hook token or follow redirects.
-    if not (parsed.hostname == "qpic.cn" or parsed.hostname.endswith(".qpic.cn")):
+    host = parsed.hostname
+    qpic = host == "qpic.cn" or host.endswith(".qpic.cn")
+    wechat_store = host == "wxapp.tc.qq.com" and re.fullmatch(r"/[0-9]+/[0-9]+/stodownload", parsed.path)
+    if parsed.username is not None or not (qpic or wechat_store):
         return "", ""
     try:
         if parsed.port not in {None, 80, 443}:
             return "", ""
     except ValueError:
         return "", ""
-    return urlunsplit(("https", parsed.hostname, parsed.path, parsed.query, "")), digest
+    return urlunsplit(("https", host, parsed.path, parsed.query, "")), digest
 
 
 def forward_nodes(content: str) -> list[dict] | None:

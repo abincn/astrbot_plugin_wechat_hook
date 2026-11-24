@@ -8,7 +8,13 @@
 **默认关闭发送。** 标准发送入口在关闭时明确报错；显式草稿使用 `await event.save_draft(chain)`，不会被标记为已发送。在平台设置中打开“允许真实发送”后，新回复可以提交给 Hook 发送文本或群 @。
 图片通过 AstrBot 标准解析器支持本地路径、URL、file URI 和 Base64，解析后只发送 4 MiB 以内的 PNG/JPEG；也支持 AstrBot 按会话进行后台发送。标准 `File` 组件通过流式上传发送原文件，包括音乐插件回退的音频文件，不按扩展名或时长过滤。`Record` 组件接入原生语音任务，使用 AstrBot 标准音频解析器准备 WAV。适配器不设置时长限制；Hook 14 按微信每条最多 60 秒切段并依次发送，插件记录终结段数。文件容量沿用 Hook 的 200 MiB 上限。流式上传需 Hook 12 或后续兼容版，分段需 Hook 14；语音还要求 type_available.voice=true。视频、原生引用及 @全体发送暂不支持。语音气泡实际收件和播放尚未验收，历史草稿不会自动发送。
 
-v0.6.20 要求 AstrBot >=4.29.4,<5。语音调用等待持久化的原生任务结果：明确失败向调用插件返回异常，结果未知只记录状态、不自动重发；原生提交不等于对端播放成功。发送日志使用 AstrBot 日志通道，启动回显最近五条任务状态。升级说明见 [接口兼容与数据说明](docs/ADAPTER-COMPATIBILITY.md)。从旧版本升级请完整重启一次 AstrBot，以清除旧版本未登记的 Provider 兼容修改。
+v0.6.21 在 v0.6.20 基础上新增单源夜间维护状态交接、AstrBot 后台微信扫码登录视图，并合并后台联系人昵称解析、64 位 `msgsvrid` 重登去重及表情 CDN 下载修复；要求 AstrBot >=4.29.4,<5。语音调用等待持久化的原生任务结果：明确失败向调用插件返回异常，结果未知只记录状态、不自动重发；原生提交不等于对端播放成功。发送日志使用 AstrBot 日志通道，启动回显最近五条任务状态。升级说明见 [接口兼容与数据说明](docs/ADAPTER-COMPATIBILITY.md)。从旧版本升级请完整重启一次 AstrBot，以清除旧版本未登记的 Provider 兼容修改。
+
+### v0.6.21：夜间单源维护交接与后台扫码登录
+
+- **单源维护状态交接（`maintenance_window_enabled`，默认关闭）**：无需在 AstrBot 重复配置停启时间、时区、宽限或随机延迟。停启计划仅在微信端（Windows `WxcxLoader` / Linux `wechat-maintenance`）设置；停机前 Hook 下发包含预计恢复时间 `resume_at` 的维护状态，AstrBot 将其持久化至本地 `inbox_db` 的 `runtime_state` 表。在 `now < resume_at` 的预期离线期内自动静默处于 `maintenance` 状态（暂停媒体轮询并拦截自动发送），微信恢复上线或超过 `resume_at` 后自动退出维护状态。升级时如保留了旧版局部维护时间字段会被安全忽略。
+- **AstrBot 后台微信扫码登录（`views/login/` + `/hook_qrcode`）**：新增原生插件可视化页（入口：**后台 → 插件 → 微信 Hook 连接 → 可视化视图 → 微信扫码登录**）及后台 WebChat / 管理员指令 `/hook_qrcode`。二维码由 AstrBot 后端代理拉取（接口 `/astrbot_plugin_wechat_hook/login` 受后台登录态保护，不向浏览器暴露 `hook_token`），与微信桌面 / noVNC 窗口共用同一会话，任一端扫码成功后状态自动切回已在线。
+- **合并修复**：包含联系人数据库只读兜底与异步后台昵称解析（`contacts.py`）、重启/重登按 64 位 `msgsvrid` 去重防历史消息重放（`inbox.py`），以及带合法 MD5 的微信表情 CDN 兼容下载（`payloads.py`）。
 任务编排和任务工作台由另一个仓库提供：[微信 Agent 任务插件](https://github.com/abincn/astrbot_plugin_wechat_agents)。
 只需要微信连接时无需安装 Agent 插件。
 

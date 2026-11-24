@@ -12,6 +12,19 @@ from typing import Iterator
 from .events import Inbound, normalize_event
 from .identity import conversation_session, group_session, stable_hash
 
+
+def server_message_id(event: dict) -> str:
+    """Use the outer message ID, preserving the full unsigned 64-bit value."""
+    value = event.get("msgsvrid")
+    if type(value) is int:
+        return str(value) if 0 < value <= 2**64 - 1 else ""
+    if isinstance(value, str) and 0 < len(value) <= 20 and value.isascii() and value.isdecimal():
+        number = int(value)
+        if 0 < number <= 2**64 - 1:
+            return str(number)
+    return ""
+
+
 class DurableInbox:
     """A single adapter instance owns a database and Hook cursor."""
     @contextmanager
@@ -104,6 +117,67 @@ class DurableInbox:
                 attempt_hash TEXT NOT NULL UNIQUE
             )
         """)
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS runtime_state (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+        """)
+        self._index_server_messages()
+
+    def _index_server_messages(self) -> None:
+        """Index stored events without replacing IDs linked to replies and media."""
+        with self._transaction():
+            columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(inbox)")}
+            if "server_message_id" not in columns:
+                self.conn.execute("ALTER TABLE inbox ADD COLUMN server_message_id TEXT")
+
+            last_row = 0
+            while True:
+                rows = self.conn.execute("""
+                    SELECT rowid,raw_json FROM inbox
+                    WHERE rowid>? AND server_message_id IS NULL ORDER BY rowid LIMIT 256
+                """, (last_row,)).fetchall()
+                if not rows:
+                    break
+                for row in rows:
+                    try:
+                        raw = json.loads(row["raw_json"])
+                    except (ValueError, TypeError):
+                        raw = None
+                    message_id = server_message_id(raw) if isinstance(raw, dict) else ""
+                    self.conn.execute("UPDATE inbox SET server_message_id=? WHERE rowid=?",
+                                      (message_id, row["rowid"]))
+                last_row = rows[-1]["rowid"]
+
+            self.conn.execute("""
+                CREATE INDEX IF NOT EXISTS inbox_server_message
+                ON inbox(owner,room,server_message_id) WHERE server_message_id <> ''
+            """)
+            if not last_row:
+                return
+            # Leave history and reply links intact. If several copies are still
+            # queued, retain one. Any prior dispatch, including uncertain
+            # delivery, takes precedence over a queued replay.
+            self.conn.execute("""
+                WITH ranked AS (
+                    SELECT event_id, row_number() OVER (
+                        PARTITION BY owner,room,server_message_id
+                        ORDER BY status IN ('pending','held_media'), inserted_at, rowid
+                    ) AS copy_number
+                    FROM inbox WHERE server_message_id <> ''
+                )
+                UPDATE inbox SET status='duplicate_replay', last_error='duplicate_server_message'
+                WHERE status IN ('pending','held_media')
+                  AND event_id IN (SELECT event_id FROM ranked WHERE copy_number > 1)
+            """)
+            self.conn.execute("""
+                UPDATE media_jobs
+                SET status='unknown', error='duplicate_server_message', updated_at=?
+                WHERE status IN ('new','pending','requesting')
+                  AND event_id IN (SELECT event_id FROM inbox WHERE status='duplicate_replay')
+            """, (int(time.time()),))
 
     def reconcile_interrupted_media(self) -> int:
         """Crash during a native media create leaves its result unknown; never replay."""
@@ -208,6 +282,14 @@ class DurableInbox:
                         high = max(high, seq)
                     continue
                 if message is not None:
+                    message_id = server_message_id(item)
+                    if message_id and self.conn.execute("""
+                        SELECT 1 FROM inbox
+                        WHERE owner=? AND room=? AND server_message_id=? AND server_message_id <> ''
+                        LIMIT 1
+                    """, (message.owner, message.room, message_id)).fetchone():
+                        high = max(high, seq)
+                        continue
                     text_ready = not message.media_kind
                     state = "pending" if text_ready else "held_media"
                     notice_reason = message.service_notice
@@ -216,13 +298,13 @@ class DurableInbox:
                     res = self.conn.execute("""
                         INSERT OR IGNORE INTO inbox
                         (event_id,sequence,owner,room,sender,content,kind,at_me,
-                         created_at,raw_json,status,inserted_at,media_kind,media_path)
-                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                         created_at,raw_json,status,inserted_at,media_kind,media_path,server_message_id)
+                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """, (message.event_id, message.sequence, message.owner,
                           message.room, message.sender, message.content, message.kind,
                           None if message.at_me is None else int(message.at_me),
                           message.created_at, raw, state, int(time.time()),
-                          message.media_kind, ""))
+                          message.media_kind, "", message_id))
                     if res.rowcount > 0:
                         inserted += 1
                         if notice_reason:
@@ -475,6 +557,28 @@ class DurableInbox:
                         "SELECT count(*) FROM outbound WHERE status='draft_only'").fetchone()[0],
                     "draft_conflicts": self.conn.execute(
                         "SELECT count(*) FROM outbound_conflicts").fetchone()[0]}
+
+    def get_state(self, key: str) -> dict | None:
+        with self._lock:
+            row = self.conn.execute("SELECT value FROM runtime_state WHERE key=?", (key,)).fetchone()
+            if row is None:
+                return None
+            try:
+                parsed = json.loads(row["value"])
+                return parsed if isinstance(parsed, dict) else None
+            except (ValueError, TypeError):
+                return None
+
+    def set_state(self, key: str, value: dict | None) -> None:
+        with self._lock:
+            if value is None:
+                self.conn.execute("DELETE FROM runtime_state WHERE key=?", (key,))
+                return
+            encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+            self.conn.execute(
+                "INSERT OR REPLACE INTO runtime_state(key, value, updated_at) VALUES(?,?,?)",
+                (key, encoded, int(time.time())),
+            )
 
     def close(self) -> None:
         with self._lock:

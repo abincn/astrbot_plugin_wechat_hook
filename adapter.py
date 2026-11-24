@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import ipaddress
+import time
 from contextlib import AsyncExitStack
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -33,6 +34,13 @@ from .video_inputs import VideoInputs
 from .file_artifacts import attach_file_metadata
 from .responses_files import prepare_file_upload
 from .notifications import service_notice_reason
+from .maintenance import (
+    classify_poll_error,
+    extract_hook_maintenance,
+    format_login_required_notice,
+    is_handoff_active,
+    parse_maintenance_handoff,
+)
 from .storage import InboxLease, bind_inbox, inbox_path
 from astrbot.core.platform.astr_message_event import current_message_event
 
@@ -47,9 +55,11 @@ def config_switch(value, name: str) -> bool:
 
 
 class HookResponseError(RuntimeError):
-    def __init__(self, status_code: int, route: str, detail: str, error_code: str = ""):
+    def __init__(self, status_code: int, route: str, detail: str, error_code: str = "",
+                 payload: dict | None = None):
         self.status_code = status_code
         self.error_code = error_code
+        self.payload = payload if isinstance(payload, dict) else None
         super().__init__(f"Hook {route} HTTP {status_code}: {detail[:150]}")
 
 
@@ -101,6 +111,7 @@ class HookMessageEvent(AstrMessageEvent):
         "capture_enabled": False,
         "video_frames_enabled": True,
         "video_audio_enabled": True,
+        "maintenance_window_enabled": False,
     },
     support_streaming_message=False,
     adapter_display_name="微信 Hook 连接",
@@ -116,6 +127,7 @@ class HookMessageEvent(AstrMessageEvent):
         "capture_enabled": {"type": "bool", "description": "自动开启 Hook 消息采集", "hint": "默认关闭，避免改动现有采集配置。"},
         "video_frames_enabled": {"type": "bool", "description": "视频画面分析", "hint": "使用自带 ffmpeg 最多抽取约 0、3、9 秒的三帧；需要视觉模型。"},
         "video_audio_enabled": {"type": "bool", "description": "视频音轨识别", "hint": "提取前最多120秒音轨，调用当前会话已配置的 ASR，可能产生识别费用；未配置时明确提示。"},
+        "maintenance_window_enabled": {"type": "bool", "description": "遵循微信端夜间维护状态", "hint": "开启后，自动识别微信端下发的维护状态与预计恢复时间（resume_at），停机期静默等待并暂停发送；停启时间与随机延迟仅需在微信端配置。"},
     },
 )
 class WeChatHookPlatform(Platform):
@@ -129,9 +141,21 @@ class WeChatHookPlatform(Platform):
         self.allow_remote_hook = config_switch(self.config.get("allow_remote_hook", False), "allow_remote_hook")
         self.video_frames_enabled = config_switch(self.config.get("video_frames_enabled", True), "video_frames_enabled")
         self.video_audio_enabled = config_switch(self.config.get("video_audio_enabled", True), "video_audio_enabled")
+        self.maintenance_window_enabled = config_switch(
+            self.config.get("maintenance_window_enabled", False), "maintenance_window_enabled",
+        )
+        # Drop legacy local schedule keys safely; schedule truth now lives on the WeChat side.
+        for legacy_key in (
+            "maintenance_stop_time",
+            "maintenance_start_time",
+            "maintenance_timezone",
+            "maintenance_grace_minutes",
+        ):
+            self.config.pop(legacy_key, None)
         self.config.update(enable=self._enabled, send_enabled=self.send_enabled,
                            capture_enabled=self.capture_enabled, video_frames_enabled=self.video_frames_enabled,
-                           video_audio_enabled=self.video_audio_enabled, allow_remote_hook=self.allow_remote_hook)
+                           video_audio_enabled=self.video_audio_enabled, allow_remote_hook=self.allow_remote_hook,
+                           maintenance_window_enabled=self.maintenance_window_enabled)
         self.url = str(self.config.get("hook_url") or "http://127.0.0.1:30001").strip().rstrip("/")
         self.token = str(self.config.get("hook_token") or "").strip()
         try:
@@ -171,10 +195,19 @@ class WeChatHookPlatform(Platform):
             raise
         self._stopping = asyncio.Event()
         self._run_started = False
+        self._lifecycle_state = "active"
+        self._maintenance_handoff = self._inbox.get_state("maintenance_handoff") if self.maintenance_window_enabled else None
+        if not self.maintenance_window_enabled:
+            self._inbox.set_state("maintenance_handoff", None)
+        elif self._maintenance_handoff is not None and not is_handoff_active(self._maintenance_handoff):
+            self._maintenance_handoff = None
+            self._inbox.set_state("maintenance_handoff", None)
+        self._last_login_probe = 0.0
+        self._login_state_supported = True
         self._media_root = location.parent / 'media'
         self._client: httpx.AsyncClient | None = None
         self._task_runtime = None
-        self._contacts = ContactNames(self._request)
+        self._contacts = ContactNames(self._request, cache_path=self._media_root.parent / "wechat_hook_names.sqlite3", owner=self.owner)
         self._video_inputs = None
         self._meta = PlatformMetadata(
             name="wechat_pc_hook", description="PC WeChat Hook with persistent inbound audit",
@@ -262,23 +295,143 @@ class WeChatHookPlatform(Platform):
             )
         if resp.status_code >= 400:
             error_code = ""
+            error_payload = None
             try:
                 error = resp.json()
-                error_code = error.get("error", "") if isinstance(error, dict) else ""
+                if isinstance(error, dict):
+                    error_payload = error
+                    error_code = str(error.get("error", "") or "")
             except ValueError:
                 pass
-            raise HookResponseError(resp.status_code, route, resp.text, error_code)
+            raise HookResponseError(resp.status_code, route, resp.text, error_code, payload=error_payload)
         payload = resp.json()
         if not isinstance(payload, (dict, list)):
             raise RuntimeError("Unexpected Hook response")
         return resp.status_code, payload
 
-    async def _poll_once(self) -> None:
+    def _record_maintenance_handoff(self, maint: dict | None) -> None:
+        if not self.maintenance_window_enabled:
+            return
+        parsed = parse_maintenance_handoff(maint)
+        if parsed is None:
+            return
+        current = self._maintenance_handoff
+        if (isinstance(current, dict)
+                and current.get("resume_at") == parsed["resume_at"]
+                and current.get("phase") == parsed["phase"]
+                and current.get("window") == parsed["window"]):
+            return
+        self._maintenance_handoff = parsed
+        if not getattr(self._inbox, "_closed", False):
+            self._inbox.set_state("maintenance_handoff", parsed)
+
+    def _clear_maintenance_handoff(self) -> None:
+        if self._maintenance_handoff is None:
+            return
+        self._maintenance_handoff = None
+        if not getattr(self._inbox, "_closed", False):
+            self._inbox.set_state("maintenance_handoff", None)
+
+    def _is_maintenance_expected(self) -> bool:
+        if not self.maintenance_window_enabled:
+            return False
+        if is_handoff_active(self._maintenance_handoff):
+            return True
+        if self._maintenance_handoff is not None:
+            self._clear_maintenance_handoff()
+        return False
+
+    def get_maintenance_handoff(self) -> dict | None:
+        if not self._is_maintenance_expected():
+            return None
+        return dict(self._maintenance_handoff)
+
+    async def _probe_maintenance_status(self) -> dict | None:
+        try:
+            _, payload = await self._request("GET", "/wxcx/maintenance/status")
+            if isinstance(payload, dict) and payload.get("active") is True:
+                self._record_maintenance_handoff(payload)
+                return payload
+        except (httpx.HTTPError, ValueError, RuntimeError):
+            pass
+        return None
+
+    async def _probe_login_state(self) -> dict | None:
+        if not self._login_state_supported:
+            return None
+        try:
+            _, payload = await self._request("GET", "/wxcx/login/state")
+            if isinstance(payload, dict):
+                maint = extract_hook_maintenance(payload)
+                if maint is not None:
+                    self._record_maintenance_handoff(maint)
+                return payload
+        except HookResponseError as exc:
+            if exc.status_code == 404:
+                self._login_state_supported = False
+        except (httpx.HTTPError, ValueError, RuntimeError):
+            pass
+        return None
+
+    def _enter_lifecycle_state(self, state: str, notice: str = "") -> None:
+        previous = self._lifecycle_state
+        self._lifecycle_state = state
+        if state == "active":
+            self._clear_maintenance_handoff()
+            if self.last_error is not None:
+                self.clear_errors()
+            if previous in ("maintenance", "login_required"):
+                log.info(f"WeChat Hook connection recovered from {previous}")
+            return
+        if state == "maintenance":
+            if self.last_error is not None:
+                self.clear_errors()
+            if previous != "maintenance":
+                log.info("WeChat Hook entered scheduled maintenance window; suppressing error alerts and outbound sends")
+            return
+        if state == "login_required":
+            detail = notice or format_login_required_notice(self.url, None)
+            if self.last_error is None or self.last_error.message != detail:
+                self.record_error(detail)
+            if previous != "login_required" or (notice and previous == "login_required"):
+                log.warning(detail)
+
+    async def _poll_once(self) -> str:
         _, status = await self._request("GET", "/wxcx/messages/status")
         if not isinstance(status, dict):
             raise RuntimeError("Hook message status response has no object")
+        maint = extract_hook_maintenance(status)
+        if maint is not None:
+            self._record_maintenance_handoff(maint)
+            return "maintenance"
+        self._contacts.set_runtime((status.get("source") or {}).get("weixin_version"))
         if status.get("enabled") is False or (isinstance(status.get("source"), dict) and status["source"].get("enabled") is False):
+            if await self._probe_maintenance_status() is not None:
+                return "maintenance"
+            login_state = await self._probe_login_state()
+            if isinstance(login_state, dict):
+                maint = extract_hook_maintenance(login_state)
+                if maint is not None or login_state.get("login_screen_state") == "maintenance":
+                    if maint is not None:
+                        self._record_maintenance_handoff(maint)
+                    return "maintenance"
+                if login_state.get("local_account_ready") is False:
+                    if self._is_maintenance_expected():
+                        return "maintenance"
+                    return "login_required"
             raise RuntimeError("Hook message capture disabled: enable on the original Node console or opt into capture_enabled")
+        now_mono = time.monotonic()
+        if self._login_state_supported and (now_mono - self._last_login_probe >= 30.0 or self._is_maintenance_expected()):
+            self._last_login_probe = now_mono
+            login_state = await self._probe_login_state()
+            if isinstance(login_state, dict):
+                maint = extract_hook_maintenance(login_state)
+                if maint is not None or login_state.get("login_screen_state") == "maintenance":
+                    if maint is not None:
+                        self._record_maintenance_handoff(maint)
+                    return "maintenance"
+                if login_state.get("local_account_ready") is False:
+                    return "maintenance" if self._is_maintenance_expected() else "login_required"
         cursor = self._inbox.after()
         try:
             _, payload = await self._request("GET", f"/wxcx/messages/events?after={cursor}&limit=128")
@@ -286,7 +439,7 @@ class WeChatHookPlatform(Platform):
             if "invalid_after" in str(exc).lower() or "ahead" in str(exc).lower():
                 self._inbox.reset_cursor()
                 log.warning("Hook cursor invalid after restart; reset to zero")
-                return
+                return "active"
             raise
         events = payload if isinstance(payload, list) else payload.get("events", [])
         if not isinstance(events, list):
@@ -296,6 +449,7 @@ class WeChatHookPlatform(Platform):
             reason = service_notice_reason(raw)
             if reason:
                 log.info(f"Hook service notification retained; auto-reply skipped: reason={reason}")
+        return "active"
 
     async def run(self) -> None:
         self._run_started = True
@@ -311,30 +465,62 @@ class WeChatHookPlatform(Platform):
                 self._client = client
                 if self.capture_enabled:
                     # Explicit opt-in. Never rewrite the Hook callback URL.
-                    await self._request(
-                        "POST", "/wxcx/messages/config",
-                        data={"enabled": True, "self_id": self.owner},
-                    )
-                while not self._stopping.is_set():
                     try:
-                        await self._poll_once()
-                        if self.last_error is not None:
-                            self.clear_errors()
-                    except (httpx.HTTPError, ValueError, RuntimeError) as exc:
-                        detail = f"Hook polling failed; preserving cursor: {exc}"
-                        if self.last_error is None or self.last_error.message != detail:
-                            self.record_error(detail)
-                            log.warning(detail)
-                    try:
-                        await process_pending_media(
-                            self._inbox, self._request, self._client, self._media_root,
+                        await self._request(
+                            "POST", "/wxcx/messages/config",
+                            data={"enabled": True, "self_id": self.owner},
                         )
-                    except Exception as exc:
-                        log.warning(f"Media processing failed: {type(exc).__name__}")
+                    except (httpx.HTTPError, ValueError, RuntimeError) as exc:
+                        self._record_maintenance_handoff(extract_hook_maintenance(getattr(exc, "payload", None)))
+                        if classify_poll_error(exc, maintenance_expected=self._is_maintenance_expected()) == "maintenance":
+                            self._enter_lifecycle_state("maintenance")
+                        else:
+                            raise
+                while not self._stopping.is_set():
+                    poll_state = "active"
                     try:
-                        await self._sender.poll_once()
-                    except Exception as exc:
-                        log.warning(f"Native send status processing failed: {exc}")
+                        poll_state = await self._poll_once()
+                        if poll_state == "maintenance":
+                            self._enter_lifecycle_state("maintenance")
+                        elif poll_state == "login_required":
+                            login_state = await self._probe_login_state()
+                            self._enter_lifecycle_state(
+                                "login_required",
+                                format_login_required_notice(self.url, login_state),
+                            )
+                        else:
+                            self._enter_lifecycle_state("active")
+                    except (httpx.HTTPError, ValueError, RuntimeError) as exc:
+                        self._record_maintenance_handoff(extract_hook_maintenance(getattr(exc, "payload", None)))
+                        kind = classify_poll_error(exc, maintenance_expected=self._is_maintenance_expected())
+                        if kind == "maintenance":
+                            poll_state = "maintenance"
+                            self._enter_lifecycle_state("maintenance")
+                        elif kind == "login_required":
+                            poll_state = "login_required"
+                            login_state = await self._probe_login_state()
+                            self._enter_lifecycle_state(
+                                "login_required",
+                                format_login_required_notice(self.url, login_state),
+                            )
+                        else:
+                            poll_state = "error"
+                            self._lifecycle_state = "error"
+                            detail = f"Hook polling failed; preserving cursor: {exc}"
+                            if self.last_error is None or self.last_error.message != detail:
+                                self.record_error(detail)
+                                log.warning(detail)
+                    if poll_state == "active":
+                        try:
+                            await process_pending_media(
+                                self._inbox, self._request, self._client, self._media_root,
+                            )
+                        except Exception as exc:
+                            log.warning(f"Media processing failed: {type(exc).__name__}")
+                        try:
+                            await self._sender.poll_once()
+                        except Exception as exc:
+                            log.warning(f"Native send status processing failed: {exc}")
                     # Existing durable pending events are dispatched without sending.
                     pending = await self._contacts.resolve(self._inbox.pending(owner=self.owner))
                     for msg in pending:
@@ -354,12 +540,14 @@ class WeChatHookPlatform(Platform):
                             self._inbox.mark_error(msg.event_id, str(exc))
                             log.warning(f"Hook event quarantined: {msg.event_id}: {type(exc).__name__}")
                             continue
+                    sleep_for = max(self.interval, 10.0) if poll_state in ("maintenance", "login_required") else self.interval
                     try:
-                        await asyncio.wait_for(self._stopping.wait(), timeout=self.interval)
+                        await asyncio.wait_for(self._stopping.wait(), timeout=sleep_for)
                     except asyncio.TimeoutError:
                         pass
         finally:
             self._stopping.set()
+            await self._contacts.aclose()
             try:
                 if self._task_runtime is not None:
                     await self._task_runtime.stop()
@@ -373,6 +561,7 @@ class WeChatHookPlatform(Platform):
 
     async def terminate(self) -> None:
         self._stopping.set()
+        await self._contacts.aclose()
         try:
             if self._task_runtime is not None:
                 await self._task_runtime.stop()
@@ -456,6 +645,8 @@ class WeChatHookPlatform(Platform):
             intent_id = "imagegen-" + hashlib.sha256(key.encode("utf-8")).hexdigest()
         if native_send and (self._stopping.is_set() or self._client is None):
             raise RuntimeError("WeChat transport is not running")
+        if native_send and self._lifecycle_state == "maintenance":
+            raise RuntimeError("WeChat Hook is in scheduled maintenance window; send skipped")
         if native_send:
             # AstrBot and WeChat may run on different machines. Read the local
             # files before queuing a caption, then send bytes to the Hook.

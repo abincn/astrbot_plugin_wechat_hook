@@ -1,0 +1,8 @@
+{
+  "views": {
+    "login": {
+      "title": "微信扫码登录",
+      "description": "实时查看微信 Hook 登录/维护状态，并在 AstrBot 后台直接扫码登录。"
+    }
+  }
+}

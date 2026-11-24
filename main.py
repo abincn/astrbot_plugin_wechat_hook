@@ -1,7 +1,13 @@
 """WeChat transport with optional video media preparation; group policy lives elsewhere."""
+import os
+from pathlib import Path
+import re
+import tempfile
+
 from astrbot.api.event import filter
 from astrbot.api.star import Context, Star
 from astrbot.api import logger as log
+from .login_panel import LoginPanel, find_hook_platform, probe_hook_login_with_png
 from .responses_files import FileProtocolError, probe_file_protocol, restore_file_protocol
 
 
@@ -12,6 +18,7 @@ class Main(Star):
         super().__init__(context)
         from .adapter import WeChatHookPlatform
         self._platform_type = WeChatHookPlatform
+        self._login_panel = LoginPanel(context)
 
     async def initialize(self):
         """Restore configured robots on plugin reload; core owns initial startup."""
@@ -32,6 +39,7 @@ class Main(Star):
         if self._stopped:
             return
         self._stopped = True
+        self._login_panel.active = False
         manager = self.context.platform_manager
         errors = []
         try:
@@ -76,3 +84,31 @@ class Main(Star):
             status = getattr(exc, 'status_code', None)
             text = '文件协议验证失败：' + type(exc).__name__ + (f'，HTTP {status}' if status else '')
         yield event.plain_result(text + ' 本次未上传真实聊天附件。')
+
+    @filter.command('hook_qrcode')
+    async def hook_qrcode(self, event, platform_id: str = ''):
+        """Show current WeChat Hook login QR code on Dashboard WebChat or for admins."""
+        if event.get_platform_name() != 'webchat' and getattr(event, 'role', '') != 'admin':
+            yield event.plain_result('查看微信登录二维码仅允许后台 WebChat 或管理员使用。')
+            return
+        config, live_inst = find_hook_platform(self.context, platform_id)
+        if config is None:
+            yield event.plain_result('未找到已配置的微信 Hook 平台实例。')
+            return
+        data, raw_png = await probe_hook_login_with_png(config, live_inst)
+        safe_id = re.sub(r'[^A-Za-z0-9._-]+', '_', str(data.get('platform_id') or 'wechat_pc_hook'))
+        qr_path = Path(tempfile.gettempdir()) / f'astrbot_wxcx_qr_{safe_id}.png'
+        if data.get('status') == 'qr_code' and raw_png:
+            qr_path.write_bytes(raw_png)
+            if os.name != 'nt':
+                os.chmod(qr_path, 0o600)
+            if hasattr(event, 'image_result'):
+                yield event.image_result(str(qr_path))
+            yield event.plain_result('请使用手机微信扫码登录（微信客户端窗口与此处二维码互通，任一端扫码即生效）。')
+            return
+        if data.get('status') == 'logged_in' and qr_path.exists():
+            try:
+                qr_path.unlink()
+            except OSError:
+                pass
+        yield event.plain_result(str(data.get('detail') or '当前暂无可展示的登录二维码。'))

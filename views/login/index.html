@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>微信扫码登录</title>
+  <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+  <header class="heading">
+    <div>
+      <h1>微信扫码登录</h1>
+      <p>实时查看微信 Hook 登录与维护状态；微信窗口与本页共用同一个二维码，任一端扫码即生效。</p>
+    </div>
+    <span id="status-pill" class="pill subtle-pill">等待连接…</span>
+  </header>
+
+  <section class="toolbar" aria-label="实例与刷新控制">
+    <label class="field">
+      <span>Hook 实例</span>
+      <select id="platform-select"></select>
+    </label>
+    <div class="toolbar-actions">
+      <label class="auto-toggle"><input id="auto-refresh" type="checkbox" checked> 自动刷新（3s/10s）</label>
+      <button id="refresh-btn" type="button" class="primary">立即刷新</button>
+    </div>
+  </section>
+
+  <p id="notice" class="notice" role="status" aria-live="polite">正在连接 AstrBot 页面接口…</p>
+
+  <main class="card" aria-busy="false">
+    <div class="meta-grid">
+      <div><small>实例 ID</small><strong id="meta-id">—</strong></div>
+      <div><small>绑定账号 wxid</small><strong id="meta-wxid">—</strong></div>
+      <div><small>Hook 地址</small><strong id="meta-origin">—</strong></div>
+      <div><small>当前状态</small><strong id="meta-state">—</strong></div>
+    </div>
+
+    <section id="qr-panel" class="qr-panel" hidden>
+      <div class="qr-box">
+        <img id="qr-img" alt="微信登录二维码">
+      </div>
+      <div class="qr-hints">
+        <h2>请使用手机微信扫码登录</h2>
+        <p>该二维码实时来自微信登录窗口；你可以直接在这里扫码，也可以在微信桌面 / VNC 窗口扫码，任一端确认后本页会自动切换为“已在线”。</p>
+        <p id="qr-meta" class="subtle"></p>
+      </div>
+    </section>
+
+    <section id="empty-panel" class="empty-panel">
+      <div id="empty-icon" class="empty-icon" aria-hidden="true">◎</div>
+      <h2 id="empty-title">正在读取状态</h2>
+      <p id="empty-desc">等待从 AstrBot 后端获取当前 Hook 实例的登录与维护信息。</p>
+    </section>
+  </main>
+
+  <footer>AstrBot 仅在后台携带 hook_token 请求本机或可信内网 Hook，不会向浏览器暴露访问令牌。</footer>
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

@@ -50,7 +50,7 @@ def raw(seq=1, *, room=ROOM, owner=OWNER, name='run.py', quote=False, subtype=6)
     result = dict(event_id=f'event-{owner}-{room}-{seq}', sequence=seq, self_id=owner,
                   sender_id='wxid_peer', direction='incoming', is_group=room.endswith('@chatroom'),
                   conversation_id=room, room_id=room if room.endswith('@chatroom') else '',
-                  msgsvrid=SOURCE_ID if not quote else str(int(SOURCE_ID) + seq),
+                  msgsvrid=str(int(SOURCE_ID) + (1000 + seq if quote else seq - 1)),
                   type=49, message_kind='quote' if quote else 'file_card',
                   card={'title': name}, content='文件是什么？', message_time=1000 + seq)
     if quote:

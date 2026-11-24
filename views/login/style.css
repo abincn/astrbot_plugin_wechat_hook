@@ -1,0 +1,158 @@
+:root {
+  color-scheme: light;
+  --bg: #f1f5f9;
+  --surface: #ffffff;
+  --ink: #213c55;
+  --muted: #607487;
+  --line: #dce5ee;
+  --accent: #2463a2;
+  --accent-soft: #eaf2fb;
+  --green: #167358;
+  --green-soft: #e8f4ee;
+  --amber: #865d15;
+  --amber-soft: #fff5dc;
+  --red: #aa3c3c;
+  --red-soft: #fdecec;
+}
+[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #172430;
+  --surface: #1f303f;
+  --ink: #e4edf6;
+  --muted: #a3b5c6;
+  --line: #3a4e60;
+  --accent: #8bbff2;
+  --accent-soft: #2b455d;
+  --green: #91d9b8;
+  --green-soft: #244b40;
+  --amber: #f1ce85;
+  --amber-soft: #51442d;
+  --red: #f5a4a4;
+  --red-soft: #4d262b;
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body {
+  margin: 0;
+  padding: 28px clamp(16px, 3vw, 42px);
+  background: var(--bg);
+  color: var(--ink);
+  font: 14px/1.6 "Segoe UI", "Microsoft YaHei", sans-serif;
+}
+h1, h2, p { margin: 0; }
+h1 { font-size: 25px; font-weight: 650; letter-spacing: -.5px; }
+h2 { font-size: 18px; font-weight: 650; margin-bottom: 8px; }
+button, select { font: inherit; }
+button {
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 8px 16px;
+  background: var(--surface);
+  color: var(--ink);
+  cursor: pointer;
+}
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #ffffff;
+}
+[data-theme="dark"] button.primary { color: #172430; }
+button:disabled { opacity: .5; cursor: not-allowed; }
+select {
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 8px 12px;
+  background: var(--surface);
+  color: var(--ink);
+  min-width: 220px;
+}
+.heading {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  margin-bottom: 20px;
+}
+.heading p { color: var(--muted); margin-top: 4px; }
+.pill {
+  border-radius: 999px;
+  padding: 6px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.subtle-pill { background: var(--line); color: var(--muted); }
+.pill.logged_in { background: var(--green-soft); color: var(--green); }
+.pill.qr_code, .pill.auto_login_button, .pill.maintenance, .pill.busy {
+  background: var(--amber-soft);
+  color: var(--amber);
+}
+.pill.offline, .pill.error, .pill.auth_error, .pill.unsupported, .pill.invalid_config {
+  background: var(--red-soft);
+  color: var(--red);
+}
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: center;
+  gap: 14px;
+  padding: 14px 18px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+.field { display: flex; align-items: center; gap: 10px; }
+.field span { color: var(--muted); white-space: nowrap; }
+.toolbar-actions { display: flex; align-items: center; gap: 16px; }
+.auto-toggle { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); cursor: pointer; }
+.notice { margin: 12px 0; color: var(--muted); min-height: 22px; overflow-wrap: anywhere; }
+.notice.error { color: var(--red); }
+.card {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 22px;
+}
+.meta-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 14px;
+  padding-bottom: 18px;
+  border-bottom: 1px solid var(--line);
+}
+.meta-grid small { display: block; color: var(--muted); margin-bottom: 2px; }
+.meta-grid strong { overflow-wrap: anywhere; }
+.qr-panel {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 28px;
+  padding: 28px 8px 12px;
+}
+.qr-box {
+  padding: 14px;
+  background: #ffffff;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  width: 248px;
+  height: 248px;
+  display: grid;
+  place-items: center;
+}
+.qr-box img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  image-rendering: pixelated;
+}
+.qr-hints { flex: 1 1 280px; max-width: 52ch; }
+.qr-hints p { color: var(--muted); margin-bottom: 8px; }
+.empty-panel {
+  padding: 46px 20px 30px;
+  text-align: center;
+}
+.empty-icon { font-size: 32px; color: var(--accent); margin-bottom: 10px; }
+.empty-panel p { color: var(--muted); max-width: 50ch; margin: 0 auto; }
+.subtle { color: var(--muted); font-size: 12px; }
+footer { margin-top: 16px; color: var(--muted); font-size: 12px; text-align: center; }

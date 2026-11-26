@@ -1,4 +1,6 @@
 """WeChat transport with optional video media preparation; group policy lives elsewhere."""
+import asyncio
+import gc
 import os
 from pathlib import Path
 import re
@@ -11,6 +13,13 @@ from .login_panel import LoginPanel, find_hook_platform, probe_hook_login_with_p
 from .responses_files import FileProtocolError, probe_file_protocol, restore_file_protocol
 
 
+_LEASE_RETRY_DELAYS = (0.05, 0.1, 0.2, 0.3, 0.5, 0.5, 1.0, 1.5, 2.0, 2.0)
+
+
+def _is_inbox_lease_busy(exc: BaseException) -> bool:
+    return isinstance(exc, RuntimeError) and "Inbox is already owned by another running connector" in str(exc)
+
+
 class Main(Star):
     _stopped = False
 
@@ -19,6 +28,27 @@ class Main(Star):
         from .adapter import WeChatHookPlatform
         self._platform_type = WeChatHookPlatform
         self._login_panel = LoginPanel(context)
+
+    async def _load_platform_with_lease_wait(self, manager, config: dict) -> None:
+        # Yield once so a just-cancelled previous connector run() can unwind and close its lease.
+        await asyncio.sleep(0)
+        delays = iter(_LEASE_RETRY_DELAYS)
+        warned = False
+        while True:
+            try:
+                await manager.load_platform(config)
+                return
+            except RuntimeError as exc:
+                if not _is_inbox_lease_busy(exc):
+                    raise
+                delay = next(delays, None)
+                if delay is None:
+                    raise
+                if not warned:
+                    warned = True
+                    log.info("Waiting for previous WeChat Hook connector instance to release Inbox lock...")
+                gc.collect()
+                await asyncio.sleep(delay)
 
     async def initialize(self):
         """Restore configured robots on plugin reload; core owns initial startup."""
@@ -30,10 +60,11 @@ class Main(Star):
                 continue
             existing = self.context.get_platform_inst(config['id'])
             if existing is None:
-                await manager.load_platform(config)
+                await self._load_platform_with_lease_wait(manager, config)
             elif not isinstance(existing, self._platform_type):
-                # Older releases had no plugin terminate hook; retire their live instance.
-                await manager.reload(config)
+                # Older releases had no plugin terminate hook; retire their live instance first.
+                await manager.terminate_platform(config['id'])
+                await self._load_platform_with_lease_wait(manager, config)
 
     async def terminate(self):
         if self._stopped:

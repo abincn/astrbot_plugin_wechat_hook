@@ -8,7 +8,7 @@ import tempfile
 import time
 import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 import httpx
 
@@ -264,6 +264,70 @@ class AdapterAndLoginPanelTests(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(plat.terminate)
         return plat
 
+    async def test_run_logs_online_and_offline_only_when_lifecycle_changes(self):
+        plat = self._make_platform()
+        polls = (
+            "active", "active",
+            "login_required", "login_required", "active",
+            "maintenance", "maintenance", "active",
+            "error", "error", "active", "active",
+        )
+        poll_index = 0
+        clock = types.SimpleNamespace(monotonic=lambda: 5.0 if poll_index < 2 else 35.0)
+        login_probes = []
+
+        async def fake_request(method, route, **kwargs):
+            self.assertEqual(method, "GET")
+            state = polls[poll_index]
+            if route == "/wxcx/messages/status":
+                if poll_index == 8:
+                    raise httpx.ConnectError(f"connection lost: {plat.token}")
+                if poll_index == 9:
+                    raise adapter_mod.HookResponseError(500, route, f"response body: {plat.token}")
+                return 200, {"enabled": True, "maintenance": {"active": state == "maintenance"}}
+            if route == "/wxcx/login/state":
+                login_probes.append(poll_index)
+                return 200, {
+                    "local_account_ready": state == "active",
+                    "login_screen_state": "auto_login_button" if poll_index == 2 else "qr_code",
+                    "qrcode_url": f"/wxcx/login/qrcode?token={plat.token}",
+                }
+            if route.startswith("/wxcx/messages/events"):
+                self.assertEqual(state, "active")
+                return 200, {"events": []}
+            raise AssertionError(f"unexpected route {route}")
+
+        async def next_poll(coro, timeout=None):
+            nonlocal poll_index
+            coro.close()
+            poll_index += 1
+            if poll_index == len(polls):
+                plat._stopping.set()
+            raise asyncio.TimeoutError()
+
+        plat._request = fake_request
+        with patch.object(adapter_mod, "log") as logger, \
+             patch.object(adapter_mod, "time", clock), \
+             patch.object(adapter_mod, "process_pending_media"), \
+             patch.object(plat._sender, "poll_once"), \
+             patch.object(adapter_mod.asyncio, "wait_for", side_effect=next_poll):
+            await plat.run()
+            await plat.terminate()
+            self.assertEqual(logger.mock_calls, [
+                call.info("WeChat Hook online"),
+                call.warning("WeChat Hook 离线，请在微信端确认登录或查看 AstrBot「微信扫码登录」。"),
+                call.info("WeChat Hook online after login_required"),
+                call.info("WeChat Hook offline for scheduled maintenance. Outbound sends paused."),
+                call.info("WeChat Hook online after maintenance"),
+                call.warning("WeChat Hook offline because polling failed. Cursor preserved."),
+                call.info("WeChat Hook online after error"),
+                call.info("WeChat Hook connector stopped"),
+            ])
+
+        self.assertEqual(login_probes, [0, 2, 2, 3, 3, 4, 7, 10])
+        self.assertEqual(plat._lifecycle_state, "stopped")
+        self.assertIsNone(plat.last_error)
+
     async def test_handoff_persists_across_disconnect_and_clears_on_recovery(self):
         plat = self._make_platform(poll_interval=0.05)
         self.assertNotIn("maintenance_stop_time", plat.config)
@@ -320,7 +384,7 @@ class AdapterAndLoginPanelTests(unittest.IsolatedAsyncioTestCase):
              patch.object(adapter_mod.asyncio, "wait_for", side_effect=fast_wait):
             await plat.run()
 
-        self.assertEqual(plat._lifecycle_state, "active")
+        self.assertEqual(plat._lifecycle_state, "stopped")
         self.assertIsNone(plat.last_error)
         self.assertIsNone(plat.get_maintenance_handoff())
         self.assertEqual(media_calls, 1)
@@ -470,6 +534,77 @@ class AdapterAndLoginPanelTests(unittest.IsolatedAsyncioTestCase):
                 done.append(item)
         self.assertFalse(qr_file.exists())
         self.assertIn("已登录在线", done[0][1])
+
+    async def test_terminate_releases_lease_when_run_task_unwinds(self):
+        plat = self._make_platform(poll_interval=0.5)
+        cfg = dict(plat.config)
+
+        async def slow_poll():
+            return "active"
+
+        plat._poll_once = slow_poll
+        task = asyncio.create_task(plat.run())
+        await asyncio.sleep(0.05)
+
+        # While active, a second connector sharing the same inbox_db must be rejected.
+        with self.assertRaisesRegex(RuntimeError, "Inbox is already owned by another running connector"):
+            adapter_mod.WeChatHookPlatform(cfg, {}, asyncio.Queue())
+
+        with patch.object(adapter_mod, "log") as logger:
+            await plat.terminate()
+            await asyncio.wait_for(task, timeout=2.0)
+            await plat.terminate()
+            logger.info.assert_called_once_with("WeChat Hook connector stopped")
+
+        # Once terminated, the replacement connector must acquire the lease cleanly.
+        plat2 = adapter_mod.WeChatHookPlatform(cfg, {}, asyncio.Queue())
+        self.addAsyncCleanup(plat2.terminate)
+        await plat2.terminate()
+
+    async def test_plugin_initialize_waits_for_async_lease_release_on_reload(self):
+        db_path = Path(self.tmpdir.name) / "reload_inbox.sqlite3"
+        cfg = {
+            "id": "wechat_reload_test",
+            "type": "wechat_pc_hook",
+            "enable": True,
+            "hook_url": "http://127.0.0.1:30002",
+            "hook_token": "tok",
+            "self_wxid": "wxid_bot",
+            "inbox_db": str(db_path),
+        }
+        other_inst = types.SimpleNamespace(meta=lambda: types.SimpleNamespace(id="webchat", name="webchat"))
+        insts = [other_inst]
+        lease_holder = {"lease": adapter_mod.InboxLease(db_path)}
+
+        async def release_soon():
+            await asyncio.sleep(0.08)
+            if lease_holder["lease"] is not None:
+                lease_holder["lease"].close()
+                lease_holder["lease"] = None
+
+        async def fake_load_platform(platform_cfg):
+            plat = adapter_mod.WeChatHookPlatform(platform_cfg, {}, asyncio.Queue())
+            insts.append(plat)
+            self.addAsyncCleanup(plat.terminate)
+
+        manager = types.SimpleNamespace(
+            platforms_config=[cfg],
+            get_insts=lambda: list(insts),
+            load_platform=fake_load_platform,
+        )
+        context = types.SimpleNamespace(
+            platform_manager=manager,
+            get_platform_inst=lambda pid: None,
+        )
+        plugin = main_mod.Main(context)
+        releaser = asyncio.create_task(release_soon())
+        try:
+            await plugin.initialize()
+        finally:
+            await releaser
+            if lease_holder["lease"] is not None:
+                lease_holder["lease"].close()
+        self.assertEqual(len(insts), 2)
 
 
 if __name__ == "__main__":

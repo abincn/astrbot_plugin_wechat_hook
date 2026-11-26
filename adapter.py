@@ -195,7 +195,9 @@ class WeChatHookPlatform(Platform):
             raise
         self._stopping = asyncio.Event()
         self._run_started = False
-        self._lifecycle_state = "active"
+        self._run_task: asyncio.Task | None = None
+        self._run_done = asyncio.Event()
+        self._lifecycle_state = "starting"
         self._maintenance_handoff = self._inbox.get_state("maintenance_handoff") if self.maintenance_window_enabled else None
         if not self.maintenance_window_enabled:
             self._inbox.set_state("maintenance_handoff", None)
@@ -378,23 +380,31 @@ class WeChatHookPlatform(Platform):
         self._lifecycle_state = state
         if state == "active":
             self._clear_maintenance_handoff()
+
+        if state in ("active", "maintenance"):
             if self.last_error is not None:
                 self.clear_errors()
-            if previous in ("maintenance", "login_required"):
-                log.info(f"WeChat Hook connection recovered from {previous}")
+        elif state in ("login_required", "error"):
+            if state == "login_required" and not notice:
+                notice = format_login_required_notice(self.url, None)
+            if self.last_error is None or self.last_error.message != notice:
+                self.record_error(notice)
+
+        if previous == state:
             return
-        if state == "maintenance":
-            if self.last_error is not None:
-                self.clear_errors()
-            if previous != "maintenance":
-                log.info("WeChat Hook entered scheduled maintenance window; suppressing error alerts and outbound sends")
-            return
-        if state == "login_required":
-            detail = notice or format_login_required_notice(self.url, None)
-            if self.last_error is None or self.last_error.message != detail:
-                self.record_error(detail)
-            if previous != "login_required" or (notice and previous == "login_required"):
-                log.warning(detail)
+        if state == "active":
+            if previous == "starting":
+                log.info("WeChat Hook online")
+            else:
+                log.info(f"WeChat Hook online after {previous}")
+        elif state == "maintenance":
+            log.info("WeChat Hook offline for scheduled maintenance. Outbound sends paused.")
+        elif state == "login_required":
+            log.warning("WeChat Hook 离线，请在微信端确认登录或查看 AstrBot「微信扫码登录」。")
+        elif state == "error":
+            log.warning("WeChat Hook offline because polling failed. Cursor preserved.")
+        elif state == "stopped" and previous != "starting":
+            log.info("WeChat Hook connector stopped")
 
     async def _poll_once(self) -> str:
         _, status = await self._request("GET", "/wxcx/messages/status")
@@ -421,7 +431,11 @@ class WeChatHookPlatform(Platform):
                     return "login_required"
             raise RuntimeError("Hook message capture disabled: enable on the original Node console or opt into capture_enabled")
         now_mono = time.monotonic()
-        if self._login_state_supported and (now_mono - self._last_login_probe >= 30.0 or self._is_maintenance_expected()):
+        if self._login_state_supported and (
+            self._lifecycle_state != "active"
+            or now_mono - self._last_login_probe >= 30.0
+            or self._is_maintenance_expected()
+        ):
             self._last_login_probe = now_mono
             login_state = await self._probe_login_state()
             if isinstance(login_state, dict):
@@ -453,6 +467,8 @@ class WeChatHookPlatform(Platform):
 
     async def run(self) -> None:
         self._run_started = True
+        self._run_task = asyncio.current_task()
+        self._run_done.clear()
         try:
             if not self._enabled or self._stopping.is_set():
                 return
@@ -505,11 +521,7 @@ class WeChatHookPlatform(Platform):
                             )
                         else:
                             poll_state = "error"
-                            self._lifecycle_state = "error"
-                            detail = f"Hook polling failed; preserving cursor: {exc}"
-                            if self.last_error is None or self.last_error.message != detail:
-                                self.record_error(detail)
-                                log.warning(detail)
+                            self._enter_lifecycle_state("error", f"Hook polling failed; preserving cursor: {exc}")
                     if poll_state == "active":
                         try:
                             await process_pending_media(
@@ -547,29 +559,42 @@ class WeChatHookPlatform(Platform):
                         pass
         finally:
             self._stopping.set()
-            await self._contacts.aclose()
             try:
+                await self._contacts.aclose()
                 if self._task_runtime is not None:
                     await self._task_runtime.stop()
             finally:
                 self._client = None
                 self._inbox.close()
                 self._lease.close()
+                self._enter_lifecycle_state("stopped")
+                self._run_task = None
+                self._run_done.set()
 
     def to_event(self, item: Inbound) -> AstrMessageEvent:
         return self.create_event(self.to_astrbot(item))
 
     async def terminate(self) -> None:
         self._stopping.set()
-        await self._contacts.aclose()
+        run_task = self._run_task
+        current = asyncio.current_task()
+        if self._run_started and not self._run_done.is_set():
+            try:
+                await asyncio.wait_for(asyncio.shield(self._run_done.wait()), timeout=2.0)
+            except asyncio.TimeoutError:
+                if run_task is not None and run_task is not current and not run_task.done():
+                    run_task.cancel()
+                    try:
+                        await asyncio.wait_for(asyncio.shield(self._run_done.wait()), timeout=2.0)
+                    except (asyncio.TimeoutError, asyncio.CancelledError):
+                        pass
         try:
+            await self._contacts.aclose()
             if self._task_runtime is not None:
                 await self._task_runtime.stop()
         finally:
-            # The manager can cancel a scheduled run before its coroutine starts.
-            if not self._run_started:
-                self._inbox.close()
-                self._lease.close()
+            self._inbox.close()
+            self._lease.close()
 
     async def send_by_session(self, session, message_chain: MessageChain,
                               origin_event: HookMessageEvent | None = None, *,

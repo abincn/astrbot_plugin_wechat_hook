@@ -88,6 +88,17 @@ class InboxLease:
         finally:
             self.stream.close()
 
+    def __del__(self) -> None:
+        stream = getattr(self, "stream", None)
+        if stream is not None and not stream.closed:
+            try:
+                self.close()
+            except OSError:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+
 
 def bind_inbox(inbox, instance_id: str, owner: str) -> None:
     with inbox._transaction():
